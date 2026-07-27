@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/pavel/.local/bin/check-all-updates --quick --notify
+ExecStart=%h/.local/bin/check-all-updates --quick --notify
 Environment=PYTHONUNBUFFERED=1
 Nice=10
 IOSchedulingClass=idle

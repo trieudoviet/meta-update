@@ -38,11 +38,11 @@
 
 | File | Vai trò |
 |---|---|
-| `/home/pavel/.local/bin/check-all-updates` | Launcher v3 |
-| `/home/pavel/.local/lib/update-checker/update_checker.py` | Core |
-| `/home/pavel/.config/update-checker/config.toml` | Inventory/config |
-| `/home/pavel/.config/systemd/user/update-checker.service` | Check service |
-| `/home/pavel/.config/systemd/user/update-checker.timer` | Lịch 16:00 |
-| `/home/pavel/.local/lib/update-checker/tests/test_update_checker.py` | Unit tests |
+| `~/.local/bin/check-all-updates` | Launcher v3 |
+| `~/.local/lib/update-checker/update_checker.py` | Core |
+| `~/.config/update-checker/config.toml` | Inventory/config |
+| `~/.config/systemd/user/update-checker.service` | Check service |
+| `~/.config/systemd/user/update-checker.timer` | Lịch 16:00 |
+| `~/.local/lib/update-checker/tests/test_update_checker.py` | Unit tests |
 
 #history #update-checker #python #systemd #ubuntu
