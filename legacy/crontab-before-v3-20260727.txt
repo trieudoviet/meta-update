@@ -1,0 +1,6 @@
+# Cocai PostgreSQL backup → local + Google Drive (daily 00:10 VN)
+10 17 * * * /home/pavel/cocai/scripts/backup-db.sh >> /var/log/cocai-backup.log 2>&1
+15 7 * * * /work/mindflow2/scripts/check-morning-briefing.sh >> /work/mindflow2/backups/mindflow-watchdog.log 2>&1
+
+# Daily software update check at 16:00 VN
+0 9 * * * /home/pavel/.local/bin/check-all-updates --quick >> /home/pavel/.local/share/update-checker/cron.log 2>&1
