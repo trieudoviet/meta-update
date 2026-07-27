@@ -1,8 +1,7 @@
-# 🔄 Hướng Dẫn Sử Dụng: Update Checker v3
+# 🔄 Hướng Dẫn Sử Dụng: Update Checker
 
-> **Ngày nâng cấp:** 27/07/2026  
 > **Lệnh:** `~/.local/bin/check-all-updates`  
-> **Phiên bản:** v3.0.0 — Python core · TOML config · Verified updates  
+> **Phiên bản:** 3.0.0 — Python core · TOML config · Verified updates  
 > **Lịch tự động:** 16:00 giờ Việt Nam mỗi ngày
 
 ---
@@ -10,7 +9,7 @@
 ## Tổng quan
 
 Update Checker kiểm tra phần mềm được cài từ APT, Snap, GitHub Releases,
-npm, standalone CLI và AppImage. Phiên bản v3 ưu tiên ba mục tiêu:
+npm, standalone CLI và AppImage. Các mục tiêu chính:
 
 1. Không chạy lệnh update thông qua `eval`.
 2. Chỉ báo thành công khi version sau update đạt version mục tiêu.
@@ -84,7 +83,7 @@ check-all-updates --history 30
 | ⬆️ Major | Có major version mới; không đồng nghĩa với lỗi bảo mật |
 | ❓ Unknown | Không lấy được version hiện tại/latest |
 
-V3 không dùng nhãn “Critical” cho mọi major update vì major version không
+Không dùng nhãn “Critical” cho mọi major update vì major version không
 phản ánh mức độ nghiêm trọng bảo mật.
 
 ---
@@ -120,7 +119,7 @@ Các loại adapter hiện có:
 | Latest | `apt`, `snap`, `npm`, `github` |
 | Update | `apt`, `snap`, `command`, `github_deb`, `github_zip_deb`, `manual` |
 
-Nếu đặt biến môi trường `GITHUB_TOKEN`, v3 tự gửi token cho GitHub API.
+Nếu đặt biến môi trường `GITHUB_TOKEN`, token sẽ tự động được gửi cho GitHub API.
 
 ---
 
@@ -141,7 +140,7 @@ Quy trình áp dụng cho RustDesk và Flameshot:
 
 ## Systemd user timer
 
-V3 không còn dùng cron. Timer đang chạy theo timezone local của hệ thống:
+Timer chạy theo timezone local của hệ thống:
 
 ```ini
 OnCalendar=*-*-* 16:00:00
@@ -179,14 +178,14 @@ Timer chỉ thực hiện check và gửi desktop notification; không tự đ�
 ~/.local/share/update-checker/
 ├── history.jsonl
 ├── latest-report.md
-├── report-v3-YYYYMMDD-HHMMSS.md
-├── update-v3-YYYYMMDD-HHMMSS.log
+├── report-YYYYMMDD-HHMMSS.md
+├── update-YYYYMMDD-HHMMSS.log
 └── .update-checker.lock
 ```
 
 - `history.jsonl`: một JSON record cho mỗi lần check.
 - `latest-report.md`: symlink tới report mới nhất.
-- `update-v3-*`: output và kết quả verify của mỗi lần apply.
+- `update-*`: output và kết quả verify của mỗi lần apply.
 - Journal của timer nằm trong systemd user journal.
 
 ---
@@ -204,31 +203,8 @@ Timer chỉ thực hiện check và gửi desktop notification; không tự đ�
     └── inventory và adapter config
 ```
 
-V3 chỉ dùng Python standard library và các công cụ hệ thống sẵn có:
+Chỉ dùng Python standard library và các công cụ hệ thống sẵn có:
 `dpkg`, `apt`, `snap`, `7z`, `sudo` và `notify-send`.
-
----
-
-## Rollback
-
-Bản Bash v2 được giữ tại:
-
-```text
-~/.local/bin/check-all-updates-v2.20260727
-```
-
-Khôi phục tạm thời:
-
-```bash
-cp ~/.local/bin/check-all-updates-v2.20260727 ~/.local/bin/check-all-updates
-chmod +x ~/.local/bin/check-all-updates
-```
-
-Backup crontab trước migration:
-
-```text
-~/.local/share/update-checker/crontab-before-v3-20260727.txt
-```
 
 ---
 

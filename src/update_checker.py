@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update Checker v3.
+"""Update Checker.
 
 Local-first software inventory, update planning, verified GitHub asset updates,
 and machine-readable reporting for Ubuntu workstations.
@@ -561,7 +561,7 @@ class UpdateChecker:
         if spec.get("require_digest", False) and not expected_digest.startswith("sha256:"):
             raise UpdateError(f"GitHub asset has no SHA-256 digest: {asset_name}")
 
-        with tempfile.TemporaryDirectory(prefix="update-checker-v3-") as temp_name:
+        with tempfile.TemporaryDirectory(prefix="update-checker-") as temp_name:
             temp_dir = Path(temp_name)
             downloaded = temp_dir / asset_name
             log.write(f"Download: {asset_url}\n")
@@ -669,10 +669,10 @@ class UpdateChecker:
 
         self.report_dir.mkdir(parents=True, exist_ok=True)
         timestamp = dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-        log_path = self.report_dir / f"update-v3-{timestamp}.log"
+        log_path = self.report_dir / f"update-{timestamp}.log"
         failures = 0
         with log_path.open("w", encoding="utf-8") as log:
-            log.write(f"# Update Checker v3 — {dt.datetime.now().astimezone().isoformat()}\n\n")
+            log.write(f"# Update Checker — {dt.datetime.now().astimezone().isoformat()}\n\n")
             for index, action in enumerate(actions, start=1):
                 log.write(f"## [{index}] {action.result.name}\n\n")
                 if not action.automatic:
@@ -877,12 +877,12 @@ class UpdateChecker:
         self.report_dir.mkdir(parents=True, exist_ok=True)
         now = dt.datetime.now().astimezone()
         timestamp = now.strftime("%Y%m%d-%H%M%S")
-        report_path = self.report_dir / f"report-v3-{timestamp}.md"
+        report_path = self.report_dir / f"report-{timestamp}.md"
         latest_path = self.report_dir / "latest-report.md"
         summary = summarize(results)
 
         lines = [
-            f"# Update Check Report v3 — {now.strftime('%d/%m/%Y %H:%M:%S')}",
+            f"# Update Check Report — {now.strftime('%d/%m/%Y %H:%M:%S')}",
             "",
             "| Nguồn | Phần mềm | Hiện tại | Mới nhất | Trạng thái |",
             "|---|---|---:|---:|---|",
@@ -1035,7 +1035,7 @@ def json_payload(
 def print_history(report_dir: Path, limit: int) -> int:
     path = report_dir / "history.jsonl"
     if not path.exists():
-        print("Chưa có lịch sử v3.")
+        print("Chưa có lịch sử.")
         return 0
     lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
     for line in lines:

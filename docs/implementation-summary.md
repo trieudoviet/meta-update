@@ -1,23 +1,20 @@
-# Update Checker v3 — Implementation Summary
+# Update Checker — Implementation Summary
 
-- **Ngày triển khai:** 27/07/2026
-- **Phiên bản:** `3.0.0`
 - **Runtime:** Python `3.12`, không có dependency Python bên thứ ba
 
-## Kết quả
+## Tính năng chính
 
-- Thay Bash monolith bằng Python core và TOML inventory.
-- Giữ launcher tương thích tại `~/.local/bin/check-all-updates`.
-- Giữ bản rollback v2 tại `~/.local/bin/check-all-updates-v2.20260727`.
-- Hợp nhất mỗi app thành một identity; không còn đếm RustDesk/Flameshot hai lần.
-- Thay `eval` bằng argv có cấu trúc.
-- JSON stdout đã được kiểm bằng `jq`.
+- Python core và TOML inventory thay vì Bash monolith.
+- Launcher tương thích tại `~/.local/bin/check-all-updates`.
+- Mỗi app là một identity duy nhất; không đếm trùng.
+- Không sử dụng `eval`; mọi lệnh chạy qua argv có cấu trúc.
+- JSON stdout (`--json`) tương thích `jq`.
 - `--apply` ngoài TTY fail-closed nếu thiếu `--yes`.
 - Verification yêu cầu version sau update đạt version mục tiêu.
-- Thêm lock chống chạy chồng, `--dry-run`, history JSONL và duplicate detector.
+- Lock chống chạy chồng, `--dry-run`, history JSONL và duplicate detector.
 - RustDesk/Flameshot dùng verified GitHub asset updater với SHA-256 và `.deb` metadata validation.
 - Obsidian version được đọc trực tiếp từ `resources/app.asar` trong AppImage.
-- Chuyển cron sang systemd user timer lúc `16:00` local với `Persistent=true`.
+- Systemd user timer lúc `16:00` local với `Persistent=true`.
 
 ## Kiểm thử
 
@@ -25,7 +22,7 @@
 - Python bytecode compilation: pass.
 - TOML config: 23 app IDs, không trùng.
 - Full live check: `OK=23`, `Update=0`, `Major=0`, `Unknown=0`.
-- Auto-discovery: chỉ còn `winbox`, khớp kỳ vọng từ v2.
+- Auto-discovery: chỉ còn `winbox`, khớp kỳ vọng.
 - Live GitHub asset resolution:
   - RustDesk `1.4.9`: tải thật, hash và package metadata đều hợp lệ.
   - Flameshot `14.0.0`: tải thật, outer/inner hash và package metadata đều hợp lệ.
@@ -38,7 +35,7 @@
 
 | File | Vai trò |
 |---|---|
-| `~/.local/bin/check-all-updates` | Launcher v3 |
+| `~/.local/bin/check-all-updates` | Launcher |
 | `~/.local/lib/update-checker/update_checker.py` | Core |
 | `~/.config/update-checker/config.toml` | Inventory/config |
 | `~/.config/systemd/user/update-checker.service` | Check service |

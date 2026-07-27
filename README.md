@@ -1,6 +1,6 @@
 # Meta Update
 
-Source project for **Update Checker v3.0.0**.
+Source project for **Update Checker**.
 
 ## Project layout
 
@@ -11,7 +11,6 @@ config/    TOML software inventory
 systemd/   User service and timer
 tests/     Unit tests
 docs/      Vietnamese usage guide and implementation summary
-legacy/    v2 and pre-migration crontab backups
 ```
 
 ## Run from this checkout
