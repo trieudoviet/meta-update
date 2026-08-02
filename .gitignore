@@ -1,3 +1,20 @@
+# Ignore everything by default
+*
+
+# Whitelist: only track minimal source code files
+!.gitignore
+!README.md
+!LICENSE
+
+# Source code
+!src/
+!src/**
+!bin/
+!bin/**
+!tests/
+!tests/**
+
+# Ignore Python artifacts inside whitelisted dirs
 __pycache__/
 *.py[cod]
 .pytest_cache/
