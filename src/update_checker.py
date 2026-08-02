@@ -204,6 +204,26 @@ class HttpClient:
                     time.sleep(attempt + 1)
         raise UpdateError(f"download failed for {url}: {last_error}") from last_error
 
+    def get_text(self, url: str) -> str:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,*/*",
+                "User-Agent": f"update-checker/{VERSION}",
+            },
+        )
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    charset = response.headers.get_content_charset() or "utf-8"
+                    return response.read().decode(charset, errors="replace")
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+        raise UpdateError(f"HTTP text failed for {url}: {last_error}") from last_error
+
 
 def _copy_and_hash(source: BinaryIO, target: BinaryIO, digest: Any) -> None:
     while chunk := source.read(1024 * 1024):
@@ -398,6 +418,15 @@ class UpdateChecker:
 
         if source_type == "github":
             return self.github_release(str(spec["repo"])).version
+
+        if source_type == "http_scrape":
+            text = self.http.get_text(str(spec["url"]))
+            match = re.search(str(spec["regex"]), text)
+            if not match:
+                raise UpdateError(
+                    f"scrape regex found no version at {spec['url']}"
+                )
+            return match.group(1)
 
         raise ConfigError(f"unsupported latest source: {source_type}")
 

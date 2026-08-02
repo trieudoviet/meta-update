@@ -39,11 +39,15 @@ class FakeRunner:
 
 
 class FakeHttp:
-    def __init__(self, payload):
+    def __init__(self, payload, text=""):
         self.payload = payload
+        self.text = text
 
     def get_json(self, _url):
         return self.payload
+
+    def get_text(self, _url):
+        return self.text
 
 
 def minimal_config(apps):
@@ -253,6 +257,48 @@ class SafetyAndOutputTests(unittest.TestCase):
         decoded = json.loads(encoded)
         self.assertEqual(decoded["results"][0]["name"], 'Sample "quoted"')
         self.assertEqual(decoded["summary"]["major"], 1)
+
+
+class HttpScrapeLatestTests(unittest.TestCase):
+    WINBOX_HTML = (
+        '<a href="https://download.mikrotik.com/routeros/winbox/4.3/'
+        'WinBox_Linux.zip">Linux</a>'
+    )
+
+    def make_checker(self, html):
+        app = {
+            "id": "winbox",
+            "name": "WinBox",
+            "installed": {
+                "type": "command",
+                "argv": ["winbox", "--version"],
+                "regex": r"WinBox\s+([0-9][0-9.]*)",
+            },
+            "latest": {
+                "type": "http_scrape",
+                "url": "https://mikrotik.com/download/winbox",
+                "regex": r"routeros/winbox/([0-9][0-9.]*)/WinBox_Linux\.zip",
+            },
+            "update": {"type": "manual", "url": "https://mikrotik.com/download/winbox"},
+        }
+        return uc.UpdateChecker(
+            minimal_config([app]),
+            runner=FakeRunner(),
+            http=FakeHttp({}, text=html),
+            quiet=True,
+        )
+
+    def test_scrapes_version_from_download_url(self):
+        checker = self.make_checker(self.WINBOX_HTML)
+        self.assertEqual(
+            checker.latest_version(checker.apps[0], "4.3"),
+            "4.3",
+        )
+
+    def test_missing_version_raises_update_error(self):
+        checker = self.make_checker("<html>no winbox link here</html>")
+        with self.assertRaises(uc.UpdateError):
+            checker.latest_version(checker.apps[0], "4.3")
 
 
 if __name__ == "__main__":
