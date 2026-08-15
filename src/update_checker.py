@@ -34,6 +34,14 @@ from typing import Any, BinaryIO, Iterable, TextIO
 VERSION = "3.0.0"
 DEFAULT_CONFIG = Path("~/.config/update-checker/config.toml").expanduser()
 STATUS_ORDER = ("ok", "update", "major", "unknown")
+HIGH_PRIORITY_IDS = {
+    "google-chrome", "firefox", "obsidian", "claude-desktop",
+    "rustdesk", "docker-ce",
+}
+MEDIUM_PRIORITY_IDS = {
+    "vscode", "cursor", "codex-desktop", "codex-cli",
+    "claude-code", "uv", "codex-switcher",
+}
 
 
 class ConfigError(RuntimeError):
@@ -941,6 +949,12 @@ class UpdateChecker:
         if self.warnings:
             lines.extend(["", "## Cảnh báo", ""])
             lines.extend(f"- {warning}" for warning in self.warnings)
+        recommendations = build_recommendations(
+            results, discovered, duplicates, self.apps
+        )
+        if recommendations:
+            lines.extend(["", "## Khuyến nghị", ""])
+            lines.extend(recommendations)
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         temporary_link = self.report_dir / ".latest-report.tmp"
@@ -1027,6 +1041,11 @@ def print_table(
         print("\nCảnh báo:")
         for warning in warnings:
             print(f"- {warning}")
+    recommendations = build_recommendations(results, discovered, duplicates)
+    if recommendations:
+        print("\nKhuyến nghị:")
+        for line in recommendations:
+            print(line)
 
 
 def print_plan(actions: list[Action]) -> None:
@@ -1057,8 +1076,125 @@ def json_payload(
         "discovered": discovered,
         "duplicates": duplicates,
         "warnings": warnings,
+        "recommendations": build_recommendations(results, discovered, duplicates),
         "report": str(report_path),
     }
+
+
+def _classify_priority(
+    result: CheckResult,
+) -> tuple[int, str, str]:
+    """Return (sort_key, emoji, label) for a result that needs updating."""
+    if result.status == "major" or result.app_id in HIGH_PRIORITY_IDS:
+        return (0, "🔴", "Ưu tiên cao")
+    if result.app_id in MEDIUM_PRIORITY_IDS:
+        return (1, "🟡", "Ưu tiên trung bình")
+    return (2, "🟢", "Ưu tiên thấp")
+
+
+def _update_command_hint(result: CheckResult, apps: list[dict[str, Any]] | None) -> str:
+    """Return a short CLI hint for updating *result*."""
+    app: dict[str, Any] | None = None
+    if apps:
+        for candidate in apps:
+            if str(candidate["id"]) == result.app_id:
+                app = candidate
+                break
+    if app is None:
+        return ""
+    spec = app["update"]
+    update_type = str(spec["type"])
+    if update_type == "apt":
+        return f"sudo apt-get install --only-upgrade -y {spec['package']}"
+    if update_type == "snap":
+        return f"sudo snap refresh {spec['package']}"
+    if update_type == "command":
+        return shlex.join([str(v) for v in spec["argv"]])
+    if update_type in {"github_deb", "github_zip_deb"}:
+        return "check-all-updates --apply"
+    if update_type == "manual":
+        return f"Cập nhật thủ công: {spec['url']}"
+    return ""
+
+
+def build_recommendations(
+    results: list[CheckResult],
+    discovered: list[dict[str, str]],
+    duplicates: list[dict[str, str]],
+    apps: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Build recommendation lines for the report."""
+    updates = [r for r in results if r.status in {"update", "major"}]
+    if not updates and not discovered and not duplicates:
+        return []
+
+    lines: list[str] = []
+
+    if updates:
+        buckets: dict[str, list[CheckResult]] = {}
+        for result in updates:
+            _key, _emoji, label = _classify_priority(result)
+            buckets.setdefault(label, []).append(result)
+
+        priority_order = ["Ưu tiên cao", "Ưu tiên trung bình", "Ưu tiên thấp"]
+        emoji_map = {
+            "Ưu tiên cao": "🔴",
+            "Ưu tiên trung bình": "🟡",
+            "Ưu tiên thấp": "🟢",
+        }
+        for label in priority_order:
+            group = buckets.get(label)
+            if not group:
+                continue
+            lines.append(f"### {emoji_map[label]} {label}")
+            lines.append("")
+            for result in group:
+                lines.append(
+                    f"- **{result.name}** `{result.current}` → `{result.latest}`"
+                )
+            commands: list[str] = []
+            for result in group:
+                hint = _update_command_hint(result, apps)
+                if hint and hint not in commands:
+                    commands.append(hint)
+            if commands:
+                lines.append("")
+                lines.append("> ```")
+                for cmd in commands:
+                    lines.append(f"> {cmd}")
+                lines.append("> ```")
+            lines.append("")
+
+    if discovered:
+        lines.append("### 📦 Phần mềm phát hiện mới")
+        lines.append("")
+        lines.append("| Phần mềm | Package | Gợi ý |")
+        lines.append("|---|---|---|")
+        for item in discovered:
+            category = item.get("category", "")
+            if category == "APT":
+                ignore_field = "ignore_deb_packages"
+            elif category == "Binary":
+                ignore_field = "ignore_local_bins"
+            else:
+                ignore_field = "danh sách ignore tương ứng"
+            lines.append(
+                f"| {item['name']} | `{item['package']}` | "
+                f"Thêm vào config.toml hoặc {ignore_field} |"
+            )
+        lines.append("")
+
+    if duplicates:
+        lines.append("### ⚠️ Cài đặt trùng nguồn")
+        lines.append("")
+        for item in duplicates:
+            lines.append(
+                f"- `{item['package']}` ({item['sources']}): "
+                f"gỡ bản không dùng để tránh xung đột"
+            )
+        lines.append("")
+
+    return lines
 
 
 def print_history(report_dir: Path, limit: int) -> int:

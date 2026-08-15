@@ -301,5 +301,126 @@ class HttpScrapeLatestTests(unittest.TestCase):
             checker.latest_version(checker.apps[0], "4.3")
 
 
+class RecommendationTests(unittest.TestCase):
+    def _result(self, app_id, name, status, category="APT", update_type="apt"):
+        return uc.CheckResult(
+            app_id=app_id,
+            name=name,
+            category=category,
+            current="1.0",
+            latest="2.0",
+            status=status,
+            update_type=update_type,
+        )
+
+    def test_high_priority_for_browser(self):
+        result = self._result("google-chrome", "Google Chrome", "update")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên cao", text)
+        self.assertIn("Google Chrome", text)
+
+    def test_medium_priority_for_dev_tool(self):
+        result = self._result("cursor", "Cursor", "update")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên trung bình", text)
+
+    def test_low_priority_for_unknown_app(self):
+        result = self._result("gimp", "GIMP", "update")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên thấp", text)
+
+    def test_major_update_promoted_to_high(self):
+        result = self._result("gimp", "GIMP", "major")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên cao", text)
+        self.assertNotIn("Ưu tiên thấp", text)
+
+    def test_discovery_suggestions(self):
+        discovered = [
+            {"category": "APT", "package": "fcitx5", "name": "Fcitx 5", "version": "5.1"},
+        ]
+        lines = uc.build_recommendations([], discovered, [])
+        text = "\n".join(lines)
+        self.assertIn("Phần mềm phát hiện mới", text)
+        self.assertIn("fcitx5", text)
+        self.assertIn("ignore_deb_packages", text)
+
+    def test_binary_discovery_suggests_ignore_local_bins(self):
+        discovered = [
+            {"category": "Binary", "package": "mytool", "name": "mytool", "version": "untracked"},
+        ]
+        lines = uc.build_recommendations([], discovered, [])
+        text = "\n".join(lines)
+        self.assertIn("ignore_local_bins", text)
+
+    def test_duplicate_suggestions(self):
+        duplicates = [{"package": "discord", "sources": "APT + Snap"}]
+        lines = uc.build_recommendations([], [], duplicates)
+        text = "\n".join(lines)
+        self.assertIn("trùng nguồn", text)
+        self.assertIn("discord", text)
+
+    def test_no_updates_returns_empty(self):
+        ok_result = self._result("gimp", "GIMP", "ok")
+        lines = uc.build_recommendations([ok_result], [], [])
+        self.assertEqual(lines, [])
+
+    def test_command_hints_with_apps(self):
+        apps = [
+            {
+                "id": "cursor",
+                "name": "Cursor",
+                "installed": {"type": "dpkg", "package": "cursor"},
+                "latest": {"type": "apt", "package": "cursor"},
+                "update": {"type": "apt", "package": "cursor"},
+            }
+        ]
+        result = self._result("cursor", "Cursor", "update")
+        lines = uc.build_recommendations([result], [], [], apps=apps)
+        text = "\n".join(lines)
+        self.assertIn("sudo apt-get install --only-upgrade -y cursor", text)
+
+    def test_snap_command_hint(self):
+        apps = [
+            {
+                "id": "firefox",
+                "name": "Firefox",
+                "installed": {"type": "snap", "package": "firefox"},
+                "latest": {"type": "snap", "package": "firefox"},
+                "update": {"type": "snap", "package": "firefox"},
+            }
+        ]
+        result = self._result("firefox", "Firefox", "update", category="SNAP", update_type="snap")
+        lines = uc.build_recommendations([result], [], [], apps=apps)
+        text = "\n".join(lines)
+        self.assertIn("sudo snap refresh firefox", text)
+
+    def test_github_deb_hint(self):
+        apps = [
+            {
+                "id": "obsidian",
+                "name": "Obsidian",
+                "installed": {"type": "dpkg", "package": "obsidian"},
+                "latest": {"type": "github", "repo": "obsidianmd/obsidian-releases"},
+                "update": {
+                    "type": "github_deb",
+                    "repo": "obsidianmd/obsidian-releases",
+                    "package": "obsidian",
+                    "asset_regex": "^obsidian_{version}_amd64\\.deb$",
+                },
+            }
+        ]
+        result = self._result(
+            "obsidian", "Obsidian", "update", category="GITHUB", update_type="github_deb"
+        )
+        lines = uc.build_recommendations([result], [], [], apps=apps)
+        text = "\n".join(lines)
+        self.assertIn("check-all-updates --apply", text)
+
+
 if __name__ == "__main__":
     unittest.main()
