@@ -42,6 +42,14 @@ MEDIUM_PRIORITY_IDS = {
     "vscode", "cursor", "codex-desktop", "codex-cli",
     "claude-code", "uv", "codex-switcher",
 }
+IGNORE_SECTIONS = {
+    "libs", "oldlibs", "debug", "libdevel", "doc", "fonts",
+    "localization", "metapackages", "tasks",
+}
+TRACK_SECTIONS = {
+    "web", "net", "editors", "devel", "graphics", "video",
+    "mail", "comm", "database", "science",
+}
 
 
 class ConfigError(RuntimeError):
@@ -775,6 +783,9 @@ class UpdateChecker:
         }
         known_commands.update(str(value) for value in discovery.get("ignore_local_bins", []))
         ignore_deb = set(str(value) for value in discovery.get("ignore_deb_packages", []))
+        ignore_standalone = set(
+            str(value) for value in discovery.get("ignore_standalone", [])
+        )
         found: dict[tuple[str, str], dict[str, str]] = {}
 
         applications_dir = Path("/usr/share/applications")
@@ -785,38 +796,62 @@ class UpdateChecker:
                 continue
             if re.search(r"^NoDisplay=true$", text, re.MULTILINE | re.IGNORECASE):
                 continue
-            owner = self.runner.run(["dpkg-query", "-S", str(desktop_file)])
-            if owner.returncode != 0 or ":" not in owner.stdout:
-                continue
-            package = owner.stdout.split(":", 1)[0].split(",", 1)[0]
-            if (
-                package in known_deb
-                or package in ignore_deb
-                or package.startswith(
-                    (
-                        "ibus",
-                        "im-",
-                        "language-",
-                        "lib",
-                        "gnome-",
-                        "ubuntu-",
-                        "yaru-",
-                        "xdg-",
-                    )
-                )
-            ):
-                continue
             name_match = re.search(r"^Name=(.+)$", text, re.MULTILINE)
-            name = name_match.group(1).strip() if name_match else package
-            version = self.runner.run(
-                ["dpkg-query", "-W", "-f=${Version}", package]
-            ).stdout.strip() or "?"
-            found[("APT", package)] = {
-                "category": "APT",
-                "package": package,
-                "name": name,
-                "version": version,
-            }
+            owner = self.runner.run(["dpkg-query", "-S", str(desktop_file)])
+            if owner.returncode == 0 and ":" in owner.stdout:
+                # APT-owned desktop file
+                package = owner.stdout.split(":", 1)[0].split(",", 1)[0]
+                if (
+                    package in known_deb
+                    or package in ignore_deb
+                    or package.startswith(
+                        (
+                            "ibus",
+                            "im-",
+                            "language-",
+                            "lib",
+                            "gnome-",
+                            "ubuntu-",
+                            "yaru-",
+                            "xdg-",
+                        )
+                    )
+                ):
+                    continue
+                name = name_match.group(1).strip() if name_match else package
+                version = self.runner.run(
+                    ["dpkg-query", "-W", "-f=${Version}", package]
+                ).stdout.strip() or "?"
+                metadata = self.runner.run(
+                    ["dpkg-query", "-W", "-f=${Section}\t${Homepage}", package]
+                ).stdout.strip()
+                section, _, homepage = metadata.partition("\t")
+                found[("APT", package)] = {
+                    "category": "APT",
+                    "package": package,
+                    "name": name,
+                    "version": version,
+                    "section": section,
+                    "homepage": homepage,
+                }
+            else:
+                # Standalone app: .desktop file not owned by any dpkg package
+                stem = desktop_file.stem
+                if stem in ignore_standalone:
+                    continue
+                exec_match = re.search(r"^Exec=(\S+)", text, re.MULTILINE)
+                if not exec_match:
+                    continue
+                exec_path = Path(exec_match.group(1))
+                if not exec_path.exists():
+                    continue
+                name = name_match.group(1).strip() if name_match else stem
+                found[("Standalone", stem)] = {
+                    "category": "Standalone",
+                    "package": stem,
+                    "name": name,
+                    "version": "untracked",
+                }
 
         snap_list = self.runner.run(["snap", "list"])
         if snap_list.returncode == 0:
@@ -1117,6 +1152,50 @@ def _update_command_hint(result: CheckResult, apps: list[dict[str, Any]] | None)
     return ""
 
 
+def _parse_github_repo(url: str) -> str:
+    """Extract 'owner/repo' from a GitHub URL, or return empty string."""
+    match = re.match(
+        r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", url.strip()
+    )
+    return match.group(1) if match else ""
+
+
+def _classify_discovered(item: dict[str, str]) -> tuple[str, str]:
+    """Return (action_emoji, recommendation_text) for a discovered item."""
+    category = item.get("category", "")
+    section = item.get("section", "").rsplit("/", 1)[-1]  # "universe/utils" → "utils"
+    homepage = item.get("homepage", "")
+
+    if category == "Standalone":
+        return ("⚙️", "Nên thêm vào config.toml (standalone)")
+
+    if category == "Binary":
+        return ("❓", "Nên thêm vào config.toml hoặc ignore_local_bins")
+
+    if category in {"Snap", "AppImage"}:
+        return ("❓", f"Nên thêm vào config.toml hoặc ignore")
+
+    # APT packages: classify by section
+    if section in IGNORE_SECTIONS:
+        return ("🔇", f"Nên ignore (section: {section})")
+
+    # Input method frameworks
+    if section in {"utils", "kde", "misc"} and any(
+        keyword in item.get("package", "").lower()
+        for keyword in ("fcitx", "ibus", "scim", "uim", "input")
+    ):
+        return ("🔇", "Nên ignore (input method)")
+
+    if section in TRACK_SECTIONS:
+        if "github.com" in homepage:
+            repo = _parse_github_repo(homepage)
+            hint = f" — GitHub: {repo}" if repo else ""
+            return ("⚙️", f"Nên thêm config{hint}")
+        return ("⚙️", f"Nên thêm vào config.toml (section: {section})")
+
+    return ("❓", "Cần review thủ công")
+
+
 def build_recommendations(
     results: list[CheckResult],
     discovered: list[dict[str, str]],
@@ -1168,19 +1247,19 @@ def build_recommendations(
     if discovered:
         lines.append("### 📦 Phần mềm phát hiện mới")
         lines.append("")
-        lines.append("| Phần mềm | Package | Gợi ý |")
-        lines.append("|---|---|---|")
+        lines.append("| Phần mềm | Package | Loại | Gợi ý |")
+        lines.append("|---|---|---|---|")
         for item in discovered:
+            emoji, suggestion = _classify_discovered(item)
             category = item.get("category", "")
-            if category == "APT":
-                ignore_field = "ignore_deb_packages"
-            elif category == "Binary":
-                ignore_field = "ignore_local_bins"
+            section = item.get("section", "")
+            if section:
+                type_label = section.rsplit("/", 1)[-1]
             else:
-                ignore_field = "danh sách ignore tương ứng"
+                type_label = category
             lines.append(
                 f"| {item['name']} | `{item['package']}` | "
-                f"Thêm vào config.toml hoặc {ignore_field} |"
+                f"{type_label} | {emoji} {suggestion} |"
             )
         lines.append("")
 

@@ -341,13 +341,18 @@ class RecommendationTests(unittest.TestCase):
 
     def test_discovery_suggestions(self):
         discovered = [
-            {"category": "APT", "package": "fcitx5", "name": "Fcitx 5", "version": "5.1"},
+            {
+                "category": "APT", "package": "fcitx5", "name": "Fcitx 5",
+                "version": "5.1", "section": "universe/utils",
+                "homepage": "https://github.com/fcitx/fcitx5",
+            },
         ]
         lines = uc.build_recommendations([], discovered, [])
         text = "\n".join(lines)
         self.assertIn("Phần mềm phát hiện mới", text)
         self.assertIn("fcitx5", text)
-        self.assertIn("ignore_deb_packages", text)
+        self.assertIn("Nên ignore", text)
+        self.assertIn("input method", text)
 
     def test_binary_discovery_suggests_ignore_local_bins(self):
         discovered = [
@@ -420,6 +425,91 @@ class RecommendationTests(unittest.TestCase):
         lines = uc.build_recommendations([result], [], [], apps=apps)
         text = "\n".join(lines)
         self.assertIn("check-all-updates --apply", text)
+
+class DiscoveryClassificationTests(unittest.TestCase):
+    def test_classify_standalone_recommends_track(self):
+        item = {"category": "Standalone", "package": "antigravity-ide", "name": "Antigravity IDE"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "⚙️")
+        self.assertIn("config.toml", text)
+        self.assertIn("standalone", text)
+
+    def test_classify_ignore_section_libs(self):
+        item = {"category": "APT", "package": "libfoo", "section": "libs"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "🔇")
+        self.assertIn("ignore", text)
+
+    def test_classify_track_section_devel(self):
+        item = {
+            "category": "APT", "package": "myeditor",
+            "section": "devel", "homepage": "https://example.com",
+        }
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "⚙️")
+        self.assertIn("config.toml", text)
+
+    def test_classify_track_github_homepage(self):
+        item = {
+            "category": "APT", "package": "coolapp",
+            "section": "web", "homepage": "https://github.com/owner/coolapp",
+        }
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "⚙️")
+        self.assertIn("owner/coolapp", text)
+
+    def test_classify_input_method_ignored(self):
+        item = {
+            "category": "APT", "package": "fcitx5",
+            "section": "universe/utils", "homepage": "",
+        }
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "🔇")
+        self.assertIn("input method", text)
+
+    def test_classify_binary_suggests_review(self):
+        item = {"category": "Binary", "package": "mytool"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "❓")
+        self.assertIn("ignore_local_bins", text)
+
+    def test_classify_unknown_section_needs_review(self):
+        item = {"category": "APT", "package": "weirdpkg", "section": "alien"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "❓")
+        self.assertIn("review", text)
+
+    def test_parse_github_repo_valid(self):
+        self.assertEqual(uc._parse_github_repo("https://github.com/fcitx/fcitx5"), "fcitx/fcitx5")
+        self.assertEqual(uc._parse_github_repo("https://github.com/owner/repo.git"), "owner/repo")
+        self.assertEqual(uc._parse_github_repo("https://github.com/a/b/"), "a/b")
+
+    def test_parse_github_repo_invalid(self):
+        self.assertEqual(uc._parse_github_repo("https://example.com/foo"), "")
+        self.assertEqual(uc._parse_github_repo(""), "")
+        self.assertEqual(uc._parse_github_repo("https://github.com/only-owner"), "")
+
+    def test_discovery_table_has_type_column(self):
+        discovered = [
+            {
+                "category": "APT", "package": "gimp-extra",
+                "name": "GIMP Extra", "version": "1.0",
+                "section": "graphics", "homepage": "",
+            },
+            {
+                "category": "Standalone", "package": "antigravity-ide",
+                "name": "Antigravity IDE", "version": "untracked",
+            },
+        ]
+        lines = uc.build_recommendations([], discovered, [])
+        text = "\n".join(lines)
+        # Table header includes Loại column
+        self.assertIn("| Loại |", text)
+        # APT item shows section as type
+        self.assertIn("graphics", text)
+        # Standalone item shows category as type
+        self.assertIn("Standalone", text)
+        self.assertIn("⚙️", text)
 
 
 if __name__ == "__main__":
