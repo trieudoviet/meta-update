@@ -707,5 +707,97 @@ class AcceptDiscoveryTests(unittest.TestCase):
         self.assertIn("not found", str(ctx.exception))
 
 
+
+class SoftMuteTests(unittest.TestCase):
+    def _write_history(self, runs: list[list[str]]) -> Path:
+        """Create temp history.jsonl with N runs, each listing package names."""
+        tmpdir = tempfile.mkdtemp()
+        path = Path(tmpdir) / "history.jsonl"
+        lines = []
+        for pkgs in runs:
+            discovered = [{"package": p, "category": "APT", "name": p} for p in pkgs]
+            record = {"timestamp": "2026-08-18T10:00:00", "discovered": discovered}
+            lines.append(json.dumps(record))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_streak_count_3_consecutive(self):
+        history = self._write_history([
+            ["fcitx5", "app1"],
+            ["fcitx5", "app1"],
+            ["fcitx5", "app2"],
+        ])
+        streaks = uc._count_discovery_streak(history)
+        self.assertEqual(streaks["fcitx5"], 3)
+        self.assertEqual(streaks["app2"], 1)
+
+    def test_streak_broken_by_absence(self):
+        history = self._write_history([
+            ["app1"],
+            [],           # gap
+            ["app1"],
+        ])
+        streaks = uc._count_discovery_streak(history)
+        self.assertEqual(streaks["app1"], 1)  # only last run counts
+
+    def test_empty_history_returns_empty(self):
+        path = Path(tempfile.mkdtemp()) / "history.jsonl"
+        streaks = uc._count_discovery_streak(path)
+        self.assertEqual(streaks, {})
+
+    def test_nonexistent_history_returns_empty(self):
+        path = Path(tempfile.mkdtemp()) / "missing.jsonl"
+        streaks = uc._count_discovery_streak(path)
+        self.assertEqual(streaks, {})
+
+    def test_partition_splits_by_threshold(self):
+        discovered = [
+            {"package": "fcitx5", "category": "APT", "name": "Fcitx5"},
+            {"package": "new-app", "category": "Standalone", "name": "New"},
+        ]
+        streaks = {"fcitx5": 3, "new-app": 1}
+        new, muted = uc._partition_discovered(discovered, streaks)
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]["package"], "new-app")
+        self.assertEqual(len(muted), 1)
+        self.assertEqual(muted[0]["package"], "fcitx5")
+
+    def test_ignore_section_auto_muted(self):
+        discovered = [
+            {"package": "libfoo", "category": "APT", "name": "libfoo",
+             "section": "libs"},
+        ]
+        streaks = {}  # first appearance, streak = 0
+        new, muted = uc._partition_discovered(discovered, streaks)
+        self.assertEqual(len(new), 0)
+        self.assertEqual(len(muted), 1)
+
+    def test_backward_compat_no_discovered_field(self):
+        tmpdir = tempfile.mkdtemp()
+        path = Path(tmpdir) / "history.jsonl"
+        # Old history without 'discovered' field
+        path.write_text('{"timestamp": "2026-01-01"}\n', encoding="utf-8")
+        streaks = uc._count_discovery_streak(path)
+        self.assertEqual(streaks, {})
+
+    def test_build_recommendations_muted_section(self):
+        """Muted items show in separate '3+ lần' section."""
+        discovered = [
+            {"package": "fcitx5", "category": "APT", "name": "Fcitx5",
+             "section": "x11"},
+            {"package": "new-app", "category": "Standalone", "name": "New App"},
+        ]
+        history = self._write_history([
+            ["fcitx5"], ["fcitx5"], ["fcitx5"],  # 3 consecutive
+        ])
+        lines = uc.build_recommendations([], discovered, [], history_path=history)
+        text = "\n".join(lines)
+        # new-app in main table
+        self.assertIn("new-app", text)
+        self.assertIn("Phần mềm phát hiện mới", text)
+        # fcitx5 in muted section
+        self.assertIn("đã biết", text)
+
+
 if __name__ == "__main__":
     unittest.main()

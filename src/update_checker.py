@@ -1241,11 +1241,79 @@ def _classify_discovered(item: dict[str, str]) -> tuple[str, str]:
     return ("❓", "Cần review thủ công")
 
 
+def _count_discovery_streak(
+    history_path: Path, n: int = 5,
+) -> dict[str, int]:
+    """Count consecutive appearances of each discovered package in last N runs.
+
+    Returns: {"fcitx5": 4, "antigravity-ide": 1, ...}
+    """
+    if not history_path.exists():
+        return {}
+    raw_lines = history_path.read_text(encoding="utf-8").splitlines()
+    recent = [line for line in raw_lines[-n:] if line.strip()]
+    if not recent:
+        return {}
+
+    # Build per-run sets of discovered package names
+    run_sets: list[set[str]] = []
+    for line in recent:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        discovered = record.get("discovered", [])
+        pkgs = {item.get("package", "") for item in discovered if item.get("package")}
+        run_sets.append(pkgs)
+
+    if not run_sets:
+        return {}
+
+    # Count streaks from latest run backward
+    latest_pkgs = run_sets[-1]
+    streaks: dict[str, int] = {}
+    for pkg in latest_pkgs:
+        count = 0
+        for run in reversed(run_sets):
+            if pkg in run:
+                count += 1
+            else:
+                break
+        streaks[pkg] = count
+    return streaks
+
+
+def _partition_discovered(
+    discovered: list[dict[str, str]],
+    streaks: dict[str, int],
+    threshold: int = 3,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Split discovered items into (new_items, muted_items).
+
+    new_items: streak < threshold (show in main table)
+    muted_items: streak >= threshold (show in collapsed section)
+    """
+    new_items: list[dict[str, str]] = []
+    muted_items: list[dict[str, str]] = []
+    for item in discovered:
+        pkg = item.get("package", "")
+        streak = streaks.get(pkg, 0)
+        section = item.get("section", "")
+        # Auto-mute IGNORE_SECTIONS items regardless of streak
+        base_section = section.rsplit("/", 1)[-1] if section else ""
+        if streak >= threshold or base_section in IGNORE_SECTIONS:
+            muted_items.append(item)
+        else:
+            new_items.append(item)
+    return new_items, muted_items
+
+
 def build_recommendations(
     results: list[CheckResult],
     discovered: list[dict[str, str]],
     duplicates: list[dict[str, str]],
     apps: list[dict[str, Any]] | None = None,
+    history_path: Path | None = None,
 ) -> list[str]:
     """Build recommendation lines for the report."""
     updates = [r for r in results if r.status in {"update", "major"}]
@@ -1290,23 +1358,40 @@ def build_recommendations(
             lines.append("")
 
     if discovered:
-        lines.append("### 📦 Phần mềm phát hiện mới")
-        lines.append("")
-        lines.append("| Phần mềm | Package | Loại | Gợi ý |")
-        lines.append("|---|---|---|---|")
-        for item in discovered:
-            emoji, suggestion = _classify_discovered(item)
-            category = item.get("category", "")
-            section = item.get("section", "")
-            if section:
-                type_label = section.rsplit("/", 1)[-1]
-            else:
-                type_label = category
-            lines.append(
-                f"| {item['name']} | `{item['package']}` | "
-                f"{type_label} | {emoji} {suggestion} |"
-            )
-        lines.append("")
+        # Partition into new vs muted based on history streaks
+        if history_path:
+            streaks = _count_discovery_streak(history_path)
+            new_items, muted_items = _partition_discovered(discovered, streaks)
+        else:
+            new_items, muted_items = discovered, []
+
+        if new_items:
+            lines.append("### 📦 Phần mềm phát hiện mới")
+            lines.append("")
+            lines.append("| Phần mềm | Package | Loại | Gợi ý |")
+            lines.append("|---|---|---|---|")
+            for item in new_items:
+                emoji, suggestion = _classify_discovered(item)
+                category = item.get("category", "")
+                section = item.get("section", "")
+                if section:
+                    type_label = section.rsplit("/", 1)[-1]
+                else:
+                    type_label = category
+                lines.append(
+                    f"| {item['name']} | `{item['package']}` | "
+                    f"{type_label} | {emoji} {suggestion} |"
+                )
+            lines.append("")
+
+        if muted_items:
+            lines.append("### 📋 Phần mềm đã biết (xuất hiện 3+ lần)")
+            lines.append("")
+            for item in muted_items:
+                pkg = item.get("package", "")
+                cat = item.get("category", "")
+                lines.append(f"- `{pkg}` ({cat})")
+            lines.append("")
 
     if duplicates:
         lines.append("### ⚠️ Cài đặt trùng nguồn")
