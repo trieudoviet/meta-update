@@ -592,5 +592,120 @@ class ExecParsingTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TomlArrayInsertTests(unittest.TestCase):
+    def test_insert_into_existing_array(self):
+        text = '[discovery]\nignore_deb_packages = [\n  "existing",\n]\n'
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_deb_packages", "new-pkg")
+        self.assertIn('"existing"', result)
+        self.assertIn('"new-pkg"', result)
+
+    def test_insert_into_empty_array(self):
+        text = "[discovery]\nignore_deb_packages = []\n"
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_deb_packages", "new-pkg")
+        self.assertIn('"new-pkg"', result)
+
+    def test_insert_missing_key(self):
+        text = "[discovery]\nenabled = true\n"
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_standalone", "my-app")
+        self.assertIn('ignore_standalone = [', result)
+        self.assertIn('"my-app"', result)
+        self.assertIn("enabled = true", result)
+
+    def test_insert_missing_section(self):
+        text = "schema_version = 1\n\n[[apps]]\nid = \"test\"\n"
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_deb_packages", "pkg")
+        self.assertIn("[discovery]", result)
+        self.assertIn('"pkg"', result)
+        self.assertIn('id = "test"', result)  # existing content preserved
+
+
+class AcceptDiscoveryTests(unittest.TestCase):
+    def _setup_env(self, discovered, config_text=None):
+        """Create temp config and history files, return (config_path, report_dir)."""
+        tmpdir = tempfile.mkdtemp()
+        config_path = Path(tmpdir) / "config.toml"
+        report_dir = Path(tmpdir) / "reports"
+        report_dir.mkdir()
+        if config_text is None:
+            config_text = (
+                'schema_version = 1\n\n'
+                '[discovery]\n'
+                'ignore_deb_packages = [\n  "existing",\n]\n'
+            )
+        config_path.write_text(config_text, encoding="utf-8")
+        history_path = report_dir / "history.jsonl"
+        record = {"timestamp": "2026-08-18T10:00:00", "discovered": discovered}
+        history_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return config_path, report_dir
+
+    def test_ignore_adds_to_array(self):
+        discovered = [{"category": "APT", "package": "fcitx5", "name": "Fcitx 5"}]
+        config_path, report_dir = self._setup_env(discovered)
+        rc = uc._accept_discovery(config_path, "fcitx5:ignore", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn('"fcitx5"', content)
+        self.assertIn('"existing"', content)  # preserved
+
+    def test_ignore_standalone_uses_correct_key(self):
+        discovered = [{"category": "Standalone", "package": "myapp", "name": "My App"}]
+        config_text = "[discovery]\nenabled = true\n"
+        config_path, report_dir = self._setup_env(discovered, config_text)
+        rc = uc._accept_discovery(config_path, "myapp:ignore", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn("ignore_standalone", content)
+        self.assertIn('"myapp"', content)
+
+    def test_track_apt_appends_block(self):
+        discovered = [{"category": "APT", "package": "coolapp", "name": "Cool App"}]
+        config_path, report_dir = self._setup_env(discovered)
+        rc = uc._accept_discovery(config_path, "coolapp:track", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn('[[apps]]', content)
+        self.assertIn('id = "coolapp"', content)
+        self.assertIn('name = "Cool App"', content)
+        self.assertIn("type = \"apt\"", content)
+
+    def test_track_standalone_appends_manual(self):
+        discovered = [{"category": "Standalone", "package": "ide", "name": "IDE App"}]
+        config_path, report_dir = self._setup_env(discovered)
+        rc = uc._accept_discovery(config_path, "ide:track", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn('[[apps]]', content)
+        self.assertIn('id = "ide"', content)
+        self.assertIn('type = "manual"', content)
+        self.assertIn("TODO", content)
+
+    def test_backup_created(self):
+        discovered = [{"category": "APT", "package": "pkg", "name": "Pkg"}]
+        config_path, report_dir = self._setup_env(discovered)
+        uc._accept_discovery(config_path, "pkg:ignore", report_dir, yes=True)
+        backup = config_path.with_suffix(".toml.bak")
+        self.assertTrue(backup.exists())
+
+    def test_invalid_action_raises(self):
+        discovered = [{"category": "APT", "package": "pkg", "name": "Pkg"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with self.assertRaises(uc.ConfigError) as ctx:
+            uc._accept_discovery(config_path, "pkg:delete", report_dir, yes=True)
+        self.assertIn("delete", str(ctx.exception))
+
+    def test_invalid_format_raises(self):
+        config_path, report_dir = self._setup_env([])
+        with self.assertRaises(uc.ConfigError) as ctx:
+            uc._accept_discovery(config_path, "no-colon", report_dir, yes=True)
+        self.assertIn("invalid format", str(ctx.exception))
+
+    def test_unknown_id_raises(self):
+        discovered = [{"category": "APT", "package": "other", "name": "Other"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with self.assertRaises(uc.ConfigError) as ctx:
+            uc._accept_discovery(config_path, "missing:ignore", report_dir, yes=True)
+        self.assertIn("not found", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import difflib
 import fcntl
 import hashlib
 import json
@@ -1348,6 +1349,194 @@ def acquire_lock(report_dir: Path) -> TextIO:
     handle.flush()
     return handle
 
+_IGNORE_KEY_MAP = {
+    "APT": "ignore_deb_packages",
+    "Standalone": "ignore_standalone",
+    "Binary": "ignore_local_bins",
+}
+
+_TRACK_TEMPLATE_APT = """\n# --- Added by --accept-discovery {timestamp} ---
+[[apps]]
+id = "{app_id}"
+name = "{name}"
+installed = {{ type = "dpkg", package = "{package}" }}
+latest = {{ type = "apt", package = "{package}" }}
+update = {{ type = "apt", package = "{package}" }}
+"""
+
+_TRACK_TEMPLATE_STANDALONE = """\n# --- Added by --accept-discovery {timestamp} ---
+# TODO: Fill in correct latest/update sources for {name}
+[[apps]]
+id = "{app_id}"
+name = "{name}"
+installed = {{ type = "command", command = ["{exec_path}", "--version"], regex = "([0-9]+\\\\.[0-9]+\\\\.[0-9]+)" }}
+latest = {{ type = "github", repo = "OWNER/REPO" }}
+update = {{ type = "manual" }}
+"""
+
+
+def _insert_into_toml_array(text: str, section: str, key: str,
+                            value: str) -> str:
+    """Insert a value into a TOML array within a section, preserving format.
+
+    Handles: existing array with items, empty array, missing key, missing section.
+    """
+    quoted = f'  "{value}"'
+    # Try to find the key within the section
+    # Pattern: key = [... ] possibly multiline
+    section_pattern = re.compile(
+        rf"^\[{re.escape(section)}\]\s*$", re.MULTILINE
+    )
+    section_match = section_pattern.search(text)
+    if not section_match:
+        # Section doesn't exist — append both section and key
+        return text.rstrip() + f"\n\n[{section}]\n{key} = [\n{quoted},\n]\n"
+
+    # Find the key within this section (before next section or EOF)
+    section_start = section_match.end()
+    next_section = re.search(r"^\[", text[section_start:], re.MULTILINE)
+    section_end = section_start + next_section.start() if next_section else len(text)
+    section_text = text[section_start:section_end]
+
+    # Look for key = [...] pattern
+    key_pattern = re.compile(
+        rf"^({re.escape(key)}\s*=\s*\[)(.*?)(\])",
+        re.MULTILINE | re.DOTALL,
+    )
+    key_match = key_pattern.search(section_text)
+    if not key_match:
+        # Key doesn't exist — insert after section header
+        insert_pos = section_start
+        # Skip to end of section header line
+        newline = text.find("\n", section_start)
+        if newline != -1:
+            insert_pos = newline + 1
+        return (
+            text[:insert_pos]
+            + f"{key} = [\n{quoted},\n]\n"
+            + text[insert_pos:]
+        )
+
+    # Key exists — insert value before closing bracket
+    abs_start = section_start + key_match.start()
+    abs_end = section_start + key_match.end()
+    existing = key_match.group(2).strip()
+    if existing:
+        # Non-empty array: insert before closing ]
+        close_bracket_pos = section_start + key_match.start(3)
+        before = text[:close_bracket_pos].rstrip()
+        # Strip trailing comma to avoid double comma
+        if before.endswith(","):
+            before = before[:-1]
+        return (
+            before
+            + f",\n{quoted},\n"
+            + text[close_bracket_pos:]
+        )
+    else:
+        # Empty array: key = []
+        return (
+            text[:abs_start]
+            + f"{key} = [\n{quoted},\n]"
+            + text[abs_end:]
+        )
+
+
+def _accept_discovery(config_path: Path, spec: str, report_dir: Path,
+                      yes: bool = False) -> int:
+    """Process --accept-discovery <id>:<track|ignore>.
+
+    Reads the latest history entry to find the discovered app metadata,
+    then modifies config.toml accordingly.
+    """
+    if ":" not in spec:
+        raise ConfigError(
+            f"invalid format: '{spec}' — expected id:track or id:ignore"
+        )
+    app_id, _, action = spec.partition(":")
+    if action not in ("track", "ignore"):
+        raise ConfigError(
+            f"unknown action: '{action}' — expected 'track' or 'ignore'"
+        )
+
+    # Find app in latest history
+    history_path = report_dir / "history.jsonl"
+    if not history_path.exists():
+        raise ConfigError(
+            "no history found — run check-all-updates first"
+        )
+    last_line = ""
+    with history_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                last_line = line
+    if not last_line:
+        raise ConfigError("history file is empty")
+    record = json.loads(last_line)
+    discovered = record.get("discovered", [])
+    match = None
+    for item in discovered:
+        if item.get("package") == app_id:
+            match = item
+            break
+    if match is None:
+        raise ConfigError(
+            f"'{app_id}' not found in latest discovery "
+            f"({len(discovered)} items). Run check-all-updates first."
+        )
+
+    # Read config
+    if not config_path.exists():
+        raise ConfigError(f"config not found: {config_path}")
+    original = config_path.read_text(encoding="utf-8")
+
+    category = match.get("category", "APT")
+    name = match.get("name", app_id)
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if action == "ignore":
+        ignore_key = _IGNORE_KEY_MAP.get(category, "ignore_deb_packages")
+        modified = _insert_into_toml_array(original, "discovery", ignore_key, app_id)
+    else:  # track
+        package = match.get("package", app_id)
+        if category == "APT":
+            block = _TRACK_TEMPLATE_APT.format(
+                timestamp=now, app_id=app_id, name=name, package=package,
+            )
+        else:
+            exec_path = f"/opt/{app_id}/{app_id}"
+            block = _TRACK_TEMPLATE_STANDALONE.format(
+                timestamp=now, app_id=app_id, name=name, exec_path=exec_path,
+            )
+        modified = original.rstrip() + "\n" + block
+
+    # Show diff preview
+    if not yes:
+        print(f"\n--- {config_path} (before)")
+        print(f"+++ {config_path} (after)")
+        orig_lines = original.splitlines(keepends=True)
+        mod_lines = modified.splitlines(keepends=True)
+        diff = difflib.unified_diff(orig_lines, mod_lines, lineterm="")
+        for line in diff:
+            print(line, end="")
+        print()
+        try:
+            confirm = input("Apply changes? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return 1
+        if confirm != "y":
+            print("Cancelled.")
+            return 1
+
+    # Backup and write
+    backup = config_path.with_suffix(".toml.bak")
+    shutil.copy2(config_path, backup)
+    config_path.write_text(modified, encoding="utf-8")
+    print(f"✅ Config updated: {action} {app_id}")
+    print(f"   Backup: {backup}")
+    return 0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1363,6 +1552,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notify", action="store_true", help="send desktop notification")
     parser.add_argument("--no-discovery", action="store_true", help="skip discovery")
     parser.add_argument("--history", nargs="?", const=10, type=int, metavar="N")
+    parser.add_argument(
+        "--accept-discovery", metavar="ID:ACTION",
+        help="accept discovered app (id:track or id:ignore)",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -1374,7 +1567,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--apply cannot be combined with --json")
     if args.apply and args.dry_run:
         parser.error("--apply cannot be combined with --dry-run")
-    if args.yes and not args.apply:
+    if args.yes and not args.apply and not args.accept_discovery:
         parser.error("--yes requires --apply")
 
     try:
@@ -1382,6 +1575,11 @@ def main(argv: list[str] | None = None) -> int:
         checker = UpdateChecker(config, quiet=args.json)
         if args.history is not None:
             return print_history(checker.report_dir, max(1, args.history))
+        if args.accept_discovery:
+            return _accept_discovery(
+                args.config.expanduser(), args.accept_discovery,
+                checker.report_dir, yes=args.yes or False,
+            )
 
         with acquire_lock(checker.report_dir):
             if not args.quick:
