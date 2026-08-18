@@ -120,6 +120,7 @@ class Release:
     tag: str
     url: str
     assets: list[dict[str, Any]]
+    body: str = ""
 
 
 @dataclasses.dataclass(slots=True)
@@ -364,6 +365,7 @@ class UpdateChecker:
         self.snap_updates_cache: dict[str, str] | None = None
         self.os_release = read_os_release()
         self.warnings: list[str] = []
+        self.ai_client: Any = None  # Lazy-init if [ai] section exists
 
     def progress(self, message: str) -> None:
         if not self.quiet:
@@ -398,6 +400,7 @@ class UpdateChecker:
             tag=tag,
             url=str(payload.get("html_url") or f"https://github.com/{repo}/releases/latest"),
             assets=list(payload.get("assets") or []),
+            body=str(payload.get("body") or ""),
         )
         self.release_cache[repo] = release
         return release
@@ -1029,12 +1032,24 @@ class UpdateChecker:
         if self.warnings:
             lines.extend(["", "## Cảnh báo", ""])
             lines.extend(f"- {warning}" for warning in self.warnings)
+        history_path = self.report_dir / "history.jsonl"
         recommendations = build_recommendations(
-            results, discovered, duplicates, self.apps
+            results, discovered, duplicates, self.apps,
+            history_path=history_path if history_path.exists() else None,
         )
         if recommendations:
             lines.extend(["", "## Khuyến nghị", ""])
             lines.extend(recommendations)
+
+        # AI-assisted sections (optional, never crashes)
+        if self.ai_client:
+            try:
+                ai_lines = self._generate_ai_sections(results)
+                if ai_lines:
+                    lines.extend(["", "## 🤖 AI Analysis", ""])
+                    lines.extend(ai_lines)
+            except Exception as exc:
+                self.warn(f"AI analysis failed: {exc}")
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         temporary_link = self.report_dir / ".latest-report.tmp"
@@ -1055,6 +1070,55 @@ class UpdateChecker:
         with (self.report_dir / "history.jsonl").open("a", encoding="utf-8") as history:
             history.write(json.dumps(history_record, ensure_ascii=False) + "\n")
         return report_path
+
+    def _generate_ai_sections(self, results: list[CheckResult]) -> list[str]:
+        """Generate AI-assisted changelog summaries and CVE lookups."""
+        import ai_client as _ai
+
+        lines: list[str] = []
+        updates = [r for r in results if r.status in {"update", "major"}]
+        ai_features = self.config.get("ai", {}).get("features", [])
+
+        # Changelog summaries
+        if "changelog" in ai_features:
+            for result in updates:
+                app = next(
+                    (a for a in self.apps if str(a["id"]) == result.app_id), None
+                )
+                if not app:
+                    continue
+                # Only works for GitHub-sourced apps (cached release has body)
+                repo = app.get("latest", {}).get("repo")
+                if not repo:
+                    continue
+                release = self.release_cache.get(repo)
+                if not release or not release.body:
+                    continue
+                self.progress(f"AI summarizing {result.name}…")
+                summary = _ai.summarize_release_notes(
+                    self.ai_client,
+                    result.name,
+                    result.current,
+                    result.latest,
+                    release.body,
+                )
+                if summary:
+                    lines.append(f"**{result.name}** ({result.current} → {result.latest}):")
+                    lines.append(summary)
+                    lines.append("")
+
+        # CVE lookups
+        if "cve" in ai_features:
+            for result in updates:
+                self.progress(f"AI checking CVE for {result.name}…")
+                cve_summary = _ai.lookup_cve_summary(
+                    self.ai_client, result.name, result.current
+                )
+                if cve_summary:
+                    lines.append(f"**{result.name}** CVE: {cve_summary}")
+                    lines.append("")
+
+        return lines
 
     def notify(self, results: list[CheckResult], report_path: Path) -> None:
         if shutil.which("notify-send") is None:
@@ -1641,6 +1705,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--accept-discovery", metavar="ID:ACTION",
         help="accept discovered app (id:track or id:ignore)",
     )
+    parser.add_argument("--ai", action="store_true", help="enable AI-assisted analysis")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -1665,6 +1730,20 @@ def main(argv: list[str] | None = None) -> int:
                 args.config.expanduser(), args.accept_discovery,
                 checker.report_dir, yes=args.yes or False,
             )
+
+        # Init AI client if requested and configured
+        if args.ai:
+            ai_config = config.get("ai", {})
+            if not ai_config.get("enabled"):
+                checker.warn("--ai flag used but [ai] section not enabled in config")
+            else:
+                try:
+                    import ai_client as _ai
+                    checker.ai_client = _ai.create_client(ai_config)
+                    if checker.ai_client:
+                        checker.progress("AI client initialized")
+                except ImportError:
+                    checker.warn("ai_client module not found")
 
         with acquire_lock(checker.report_dir):
             if not args.quick:
