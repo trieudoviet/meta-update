@@ -512,5 +512,85 @@ class DiscoveryClassificationTests(unittest.TestCase):
         self.assertIn("⚙️", text)
 
 
+class ExecParsingTests(unittest.TestCase):
+    def test_extract_env_wrapper(self):
+        """env VAR=VALUE /opt/app should extract /opt/app."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "env XDG_SESSION_TYPE=X11 /opt/expressvpn/bin/expressvpn-client %u"
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/expressvpn/bin/expressvpn-client")
+
+    def test_extract_usr_bin_env(self):
+        """/usr/bin/env python3 /path/to/script should extract /path/to/script."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "/usr/bin/env python3 /path/to/script.py"
+            )
+        # python3 is not absolute, next token /path/to/script.py would be checked
+        # but since env skips VAR=VALUE only, python3 is the candidate — not absolute
+        self.assertIsNone(result)
+
+    def test_extract_env_absolute_binary(self):
+        """env /opt/app should extract /opt/app."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path("env /opt/myapp/bin/myapp")
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/myapp/bin/myapp")
+
+    def test_extract_sh_c(self):
+        """sh -c '/opt/app --flag' should extract /opt/app."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path('sh -c "/opt/custom/app --flag"')
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/custom/app")
+
+    def test_extract_direct_path(self):
+        """Direct absolute path with flags and field codes."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "/opt/antigravity-ide/antigravity-ide --ozone-platform=x11 %F"
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/antigravity-ide/antigravity-ide")
+
+    def test_extract_bare_command(self):
+        """Bare command (not absolute) returns None."""
+        result = uc._extract_exec_path("firefox %u")
+        self.assertIsNone(result)
+
+    def test_extract_empty_string(self):
+        """Empty string returns None."""
+        result = uc._extract_exec_path("")
+        self.assertIsNone(result)
+
+    def test_extract_malformed_quotes(self):
+        """Unclosed quote returns None (shlex.split raises ValueError)."""
+        result = uc._extract_exec_path('sh -c "/unclosed')
+        self.assertIsNone(result)
+
+    def test_extract_field_codes_removed(self):
+        """Field codes like %f %F %u %U are stripped before parsing."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path("/opt/app %f %F %u %U %i %c %k")
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/app")
+
+    def test_extract_env_multiple_vars(self):
+        """env with multiple VAR=VALUE pairs."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "env GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb /opt/app/run"
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/app/run")
+
+    def test_extract_nonexistent_path(self):
+        """Absolute path that doesn't exist returns None."""
+        result = uc._extract_exec_path("/nonexistent/path/to/binary")
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

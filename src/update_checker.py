@@ -50,6 +50,50 @@ TRACK_SECTIONS = {
     "web", "net", "editors", "devel", "graphics", "video",
     "mail", "comm", "database", "science",
 }
+_FIELD_CODES = {
+    "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N",
+    "%i", "%c", "%k", "%v", "%m",
+}
+
+
+def _extract_exec_path(exec_value: str) -> Path | None:
+    """Parse Exec= value from a .desktop file, handling env/sh wrappers.
+
+    Handles patterns like:
+      env VAR=VALUE /opt/app/binary %u
+      /usr/bin/env python3 /path/to/script.py
+      sh -c "/opt/custom/app --flag"
+      /opt/app/binary --ozone-platform=x11 %F
+
+    Returns the absolute Path to the real executable if it exists, else None.
+    """
+    try:
+        tokens = shlex.split(exec_value)
+    except ValueError:
+        return None
+    # Remove freedesktop field codes
+    tokens = [t for t in tokens if t not in _FIELD_CODES]
+    if not tokens:
+        return None
+    first = Path(tokens[0]).name
+    # Handle env wrapper: skip VAR=VALUE tokens
+    if first == "env":
+        tokens = tokens[1:]
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("/"):
+            tokens = tokens[1:]
+    # Handle shell -c wrapper: re-parse the inner command string
+    elif first in {"sh", "bash"}:
+        if len(tokens) >= 3 and tokens[1] == "-c":
+            try:
+                tokens = shlex.split(tokens[2])
+            except ValueError:
+                return None
+    if not tokens:
+        return None
+    candidate = Path(tokens[0])
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    return None
 
 
 class ConfigError(RuntimeError):
@@ -839,11 +883,11 @@ class UpdateChecker:
                 stem = desktop_file.stem
                 if stem in ignore_standalone:
                     continue
-                exec_match = re.search(r"^Exec=(\S+)", text, re.MULTILINE)
+                exec_match = re.search(r"^Exec=(.+)$", text, re.MULTILINE)
                 if not exec_match:
                     continue
-                exec_path = Path(exec_match.group(1))
-                if not exec_path.exists():
+                exec_path = _extract_exec_path(exec_match.group(1))
+                if not exec_path:
                     continue
                 name = name_match.group(1).strip() if name_match else stem
                 found[("Standalone", stem)] = {
