@@ -1,0 +1,193 @@
+"""Tests for ai_client module."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import time
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest import mock
+
+# Ensure src/ is importable
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+import ai_client as ai
+
+
+class AIClientCacheTests(unittest.TestCase):
+    def test_cache_hit_avoids_request(self):
+        """Second call with same cache_key returns cached value."""
+        cache_dir = tempfile.mkdtemp()
+        cache_path = Path(cache_dir) / "cache.json"
+        client = ai.AIClient("deepseek", "key", "model", cache_path)
+        # Pre-populate cache
+        cache = {"test:key": {"value": "cached result", "timestamp": time.time()}}
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        # Should return cached without calling API
+        result = client.complete("ignored prompt", cache_key="test:key")
+        self.assertEqual(result, "cached result")
+
+    def test_cache_ttl_expired_triggers_request(self):
+        """Expired cache entry should be ignored."""
+        cache_dir = tempfile.mkdtemp()
+        cache_path = Path(cache_dir) / "cache.json"
+        client = ai.AIClient("deepseek", "key", "model", cache_path)
+        # Write expired cache
+        old_ts = time.time() - (8 * 24 * 60 * 60)  # 8 days ago
+        cache = {"test:key": {"value": "old", "timestamp": old_ts}}
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        # API call will fail (no real server) → returns empty string
+        result = client.complete("prompt", cache_key="test:key")
+        self.assertEqual(result, "")  # graceful degradation
+
+    def test_cache_set_creates_file(self):
+        cache_dir = tempfile.mkdtemp()
+        cache_path = Path(cache_dir) / "sub" / "cache.json"
+        client = ai.AIClient("deepseek", "key", "model", cache_path)
+        client._set_cached("key1", "value1")
+        self.assertTrue(cache_path.exists())
+        data = json.loads(cache_path.read_text())
+        self.assertEqual(data["key1"]["value"], "value1")
+
+
+class CreateClientTests(unittest.TestCase):
+    def test_disabled_returns_none(self):
+        result = ai.create_client({"enabled": False})
+        self.assertIsNone(result)
+
+    def test_enabled_no_key_returns_none(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            result = ai.create_client({
+                "enabled": True,
+                "provider": "deepseek",
+                "api_key_env": "NONEXISTENT_KEY",
+            })
+        self.assertIsNone(result)
+
+    def test_unknown_provider_returns_none(self):
+        result = ai.create_client({
+            "enabled": True,
+            "provider": "unknown_llm",
+        })
+        self.assertIsNone(result)
+
+    def test_valid_config_returns_client(self):
+        with mock.patch.dict("os.environ", {"TEST_KEY": "sk-test123"}):
+            result = ai.create_client({
+                "enabled": True,
+                "provider": "deepseek",
+                "api_key_env": "TEST_KEY",
+                "model": "deepseek-chat",
+            })
+        self.assertIsNotNone(result)
+        self.assertEqual(result.provider, "deepseek")
+        self.assertEqual(result.api_key, "sk-test123")
+
+
+class OpenAIRequestFormatTests(unittest.TestCase):
+    def test_payload_structure(self):
+        """Verify OpenAI-compatible request builds correct JSON payload."""
+        cache_path = Path(tempfile.mkdtemp()) / "cache.json"
+        client = ai.AIClient("deepseek", "test-key", "deepseek-chat", cache_path)
+
+        captured = {}
+
+        def mock_urlopen(req, timeout=10):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.headers)
+            captured["data"] = json.loads(req.data)
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({
+                "choices": [{"message": {"content": "AI response"}}]
+            }).encode()
+            resp.__enter__ = mock.MagicMock(return_value=resp)
+            resp.__exit__ = mock.MagicMock(return_value=False)
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            result = client._openai_request("Test prompt")
+
+        self.assertEqual(result, "AI response")
+        self.assertIn("/v1/chat/completions", captured["url"])
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer test-key")
+        self.assertEqual(captured["data"]["model"], "deepseek-chat")
+        self.assertEqual(captured["data"]["messages"][0]["content"], "Test prompt")
+
+
+class GeminiRequestFormatTests(unittest.TestCase):
+    def test_payload_structure(self):
+        """Verify Gemini request builds correct JSON payload with API key in URL."""
+        cache_path = Path(tempfile.mkdtemp()) / "cache.json"
+        client = ai.AIClient("gemini", "gemini-key", "gemini-2.5-flash", cache_path)
+
+        captured = {}
+
+        def mock_urlopen(req, timeout=10):
+            captured["url"] = req.full_url
+            captured["data"] = json.loads(req.data)
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({
+                "candidates": [{"content": {"parts": [{"text": "Gemini response"}]}}]
+            }).encode()
+            resp.__enter__ = mock.MagicMock(return_value=resp)
+            resp.__exit__ = mock.MagicMock(return_value=False)
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            result = client._gemini_request("Test prompt")
+
+        self.assertEqual(result, "Gemini response")
+        self.assertIn("key=gemini-key", captured["url"])
+        self.assertIn("generateContent", captured["url"])
+        self.assertIn("gemini-2.5-flash", captured["url"])
+        parts = captured["data"]["contents"][0]["parts"]
+        self.assertEqual(parts[0]["text"], "Test prompt")
+
+
+class SummarizeReleaseNotesTests(unittest.TestCase):
+    def test_empty_body_returns_empty(self):
+        cache_path = Path(tempfile.mkdtemp()) / "cache.json"
+        client = ai.AIClient("deepseek", "key", "model", cache_path)
+        result = ai.summarize_release_notes(client, "App", "1.0", "2.0", "")
+        self.assertEqual(result, "")
+
+    def test_prompt_contains_app_info(self):
+        """Verify prompt template includes app name and versions."""
+        cache_path = Path(tempfile.mkdtemp()) / "cache.json"
+        client = ai.AIClient("deepseek", "key", "model", cache_path)
+        captured_prompt = None
+
+        def mock_complete(prompt, cache_key=None):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return "✨ Mới: Feature X\n⚠️ Lưu ý: Không có breaking changes"
+
+        client.complete = mock_complete
+        result = ai.summarize_release_notes(
+            client, "Obsidian", "1.13.4", "1.13.7", "Bug fixes and improvements"
+        )
+        self.assertIn("Obsidian", captured_prompt)
+        self.assertIn("1.13.4", captured_prompt)
+        self.assertIn("1.13.7", captured_prompt)
+        self.assertIn("✨", result)
+
+
+class GracefulDegradationTests(unittest.TestCase):
+    def test_api_error_returns_empty(self):
+        """API errors should be caught and return empty string."""
+        cache_path = Path(tempfile.mkdtemp()) / "cache.json"
+        client = ai.AIClient("deepseek", "bad-key", "model", cache_path)
+
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.HTTPError(
+                            "url", 401, "Unauthorized", {}, None)):
+            result = client.complete("prompt")
+
+        self.assertEqual(result, "")
+
+
+if __name__ == "__main__":
+    unittest.main()
