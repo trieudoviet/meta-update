@@ -208,12 +208,6 @@ python3 -m unittest discover -s tests -v
 
 ---
 
-## 📘 Documentation
-
-- [Hướng dẫn cài đặt và sử dụng (Vietnamese)](docs/huong-dan-su-dung.md)
-
----
-
 ## 📄 License
 
 Distributed under the MIT License. See `LICENSE` for details.
