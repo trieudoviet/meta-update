@@ -210,8 +210,7 @@ python3 -m unittest discover -s tests -v
 
 ## 📘 Documentation
 
-- [Hướng dẫn sử dụng chi tiết (Vietnamese Usage Guide)](docs/Hướng-dẫn-check-all-updates.md)
-- [Brainstorm Discovery & AI](docs/brainstorm-discovery-va-ai.md)
+- [Hướng dẫn cài đặt và sử dụng (Vietnamese)](docs/huong-dan-su-dung.md)
 
 ---
 
