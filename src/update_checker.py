@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import difflib
 import fcntl
 import hashlib
 import json
@@ -34,6 +35,66 @@ from typing import Any, BinaryIO, Iterable, TextIO
 VERSION = "3.0.0"
 DEFAULT_CONFIG = Path("~/.config/update-checker/config.toml").expanduser()
 STATUS_ORDER = ("ok", "update", "major", "unknown")
+HIGH_PRIORITY_IDS = {
+    "google-chrome", "firefox", "obsidian", "claude-desktop",
+    "rustdesk", "docker-ce",
+}
+MEDIUM_PRIORITY_IDS = {
+    "vscode", "cursor", "codex-desktop", "codex-cli",
+    "claude-code", "uv", "codex-switcher",
+}
+IGNORE_SECTIONS = {
+    "libs", "oldlibs", "debug", "libdevel", "doc", "fonts",
+    "localization", "metapackages", "tasks",
+}
+TRACK_SECTIONS = {
+    "web", "net", "editors", "devel", "graphics", "video",
+    "mail", "comm", "database", "science",
+}
+_FIELD_CODES = {
+    "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N",
+    "%i", "%c", "%k", "%v", "%m",
+}
+
+
+def _extract_exec_path(exec_value: str) -> Path | None:
+    """Parse Exec= value from a .desktop file, handling env/sh wrappers.
+
+    Handles patterns like:
+      env VAR=VALUE /opt/app/binary %u
+      /usr/bin/env python3 /path/to/script.py
+      sh -c "/opt/custom/app --flag"
+      /opt/app/binary --ozone-platform=x11 %F
+
+    Returns the absolute Path to the real executable if it exists, else None.
+    """
+    try:
+        tokens = shlex.split(exec_value)
+    except ValueError:
+        return None
+    # Remove freedesktop field codes
+    tokens = [t for t in tokens if t not in _FIELD_CODES]
+    if not tokens:
+        return None
+    first = Path(tokens[0]).name
+    # Handle env wrapper: skip VAR=VALUE tokens
+    if first == "env":
+        tokens = tokens[1:]
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("/"):
+            tokens = tokens[1:]
+    # Handle shell -c wrapper: re-parse the inner command string
+    elif first in {"sh", "bash"}:
+        if len(tokens) >= 3 and tokens[1] == "-c":
+            try:
+                tokens = shlex.split(tokens[2])
+            except ValueError:
+                return None
+    if not tokens:
+        return None
+    candidate = Path(tokens[0])
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    return None
 
 
 class ConfigError(RuntimeError):
@@ -59,6 +120,7 @@ class Release:
     tag: str
     url: str
     assets: list[dict[str, Any]]
+    body: str = ""
 
 
 @dataclasses.dataclass(slots=True)
@@ -303,6 +365,7 @@ class UpdateChecker:
         self.snap_updates_cache: dict[str, str] | None = None
         self.os_release = read_os_release()
         self.warnings: list[str] = []
+        self.ai_client: Any = None  # Lazy-init if [ai] section exists
 
     def progress(self, message: str) -> None:
         if not self.quiet:
@@ -323,23 +386,70 @@ class UpdateChecker:
         if result.returncode != 0:
             self.warn(f"APT refresh failed: {(result.stderr or result.stdout).strip()}")
 
-    def github_release(self, repo: str) -> Release:
-        if repo in self.release_cache:
+    def _match_asset(self, release: Release, asset_regex_template: str) -> list[dict[str, Any]]:
+        pattern = asset_regex_template.format(
+            version=re.escape(release.version),
+            os_version=re.escape(self.os_release.get("VERSION_ID", "")),
+            arch=re.escape(self.runner.run(["dpkg", "--print-architecture"]).stdout.strip()),
+        )
+        return [
+            asset
+            for asset in release.assets
+            if re.fullmatch(pattern, str(asset.get("name") or ""))
+        ]
+
+    def github_release(self, repo: str, asset_regex_template: str | None = None) -> Release:
+        cache_key = f"{repo}:{asset_regex_template}" if asset_regex_template else repo
+        if cache_key in self.release_cache:
+            return self.release_cache[cache_key]
+        if repo in self.release_cache and not asset_regex_template:
             return self.release_cache[repo]
+
         encoded_repo = urllib.parse.quote(repo, safe="/")
         payload = self.http.get_json(f"https://api.github.com/repos/{encoded_repo}/releases/latest")
         tag = str(payload.get("tag_name") or "")
         if not tag:
             raise UpdateError(f"GitHub returned no latest tag for {repo}")
-        release = Release(
+        latest_rel = Release(
             repo=repo,
             version=tag.removeprefix("v"),
             tag=tag,
             url=str(payload.get("html_url") or f"https://github.com/{repo}/releases/latest"),
             assets=list(payload.get("assets") or []),
+            body=str(payload.get("body") or ""),
         )
-        self.release_cache[repo] = release
-        return release
+
+        if not asset_regex_template or self._match_asset(latest_rel, asset_regex_template):
+            self.release_cache[cache_key] = latest_rel
+            return latest_rel
+
+        # If latest release has no matching asset (e.g. mobile-only APK release),
+        # query recent releases to find the latest release containing the target asset.
+        try:
+            releases_payload = self.http.get_json(
+                f"https://api.github.com/repos/{encoded_repo}/releases?per_page=10"
+            )
+            if isinstance(releases_payload, list):
+                for item in releases_payload:
+                    t = str(item.get("tag_name") or "")
+                    if not t or t == tag:
+                        continue
+                    candidate = Release(
+                        repo=repo,
+                        version=t.removeprefix("v"),
+                        tag=t,
+                        url=str(item.get("html_url") or ""),
+                        assets=list(item.get("assets") or []),
+                        body=str(item.get("body") or ""),
+                    )
+                    if self._match_asset(candidate, asset_regex_template):
+                        self.release_cache[cache_key] = candidate
+                        return candidate
+        except Exception:
+            pass
+
+        self.release_cache[cache_key] = latest_rel
+        return latest_rel
 
     def installed_version(self, app: dict[str, Any]) -> str | None:
         spec = app["installed"]
@@ -361,7 +471,8 @@ class UpdateChecker:
             return fields[1] if len(fields) > 1 else None
 
         if source_type == "command":
-            argv = [str(value) for value in spec["argv"]]
+            raw_argv = spec.get("argv") or spec.get("command") or []
+            argv = [str(value) for value in raw_argv]
             result = self.runner.run(argv)
             if result.returncode != 0:
                 return None
@@ -417,7 +528,11 @@ class UpdateChecker:
             return version
 
         if source_type == "github":
-            return self.github_release(str(spec["repo"])).version
+            asset_regex = (
+                app.get("latest", {}).get("asset_regex")
+                or app.get("update", {}).get("asset_regex")
+            )
+            return self.github_release(str(spec["repo"]), asset_regex if asset_regex else None).version
 
         if source_type == "http_scrape":
             text = self.http.get_text(str(spec["url"]))
@@ -562,18 +677,9 @@ class UpdateChecker:
 
     def select_github_asset(self, action: Action) -> tuple[Release, dict[str, Any]]:
         spec = action.app["update"]
-        release = self.github_release(str(spec["repo"]))
-        pattern_template = str(spec["asset_regex"])
-        pattern = pattern_template.format(
-            version=re.escape(release.version),
-            os_version=re.escape(self.os_release.get("VERSION_ID", "")),
-            arch=re.escape(self.runner.run(["dpkg", "--print-architecture"]).stdout.strip()),
-        )
-        matches = [
-            asset
-            for asset in release.assets
-            if re.fullmatch(pattern, str(asset.get("name") or ""))
-        ]
+        asset_regex = str(spec.get("asset_regex") or "")
+        release = self.github_release(str(spec["repo"]), asset_regex if asset_regex else None)
+        matches = self._match_asset(release, asset_regex) if asset_regex else release.assets
         if len(matches) != 1:
             names = ", ".join(str(asset.get("name")) for asset in matches) or "none"
             raise UpdateError(
@@ -767,6 +873,9 @@ class UpdateChecker:
         }
         known_commands.update(str(value) for value in discovery.get("ignore_local_bins", []))
         ignore_deb = set(str(value) for value in discovery.get("ignore_deb_packages", []))
+        ignore_standalone = set(
+            str(value) for value in discovery.get("ignore_standalone", [])
+        )
         found: dict[tuple[str, str], dict[str, str]] = {}
 
         applications_dir = Path("/usr/share/applications")
@@ -777,38 +886,62 @@ class UpdateChecker:
                 continue
             if re.search(r"^NoDisplay=true$", text, re.MULTILINE | re.IGNORECASE):
                 continue
-            owner = self.runner.run(["dpkg-query", "-S", str(desktop_file)])
-            if owner.returncode != 0 or ":" not in owner.stdout:
-                continue
-            package = owner.stdout.split(":", 1)[0].split(",", 1)[0]
-            if (
-                package in known_deb
-                or package in ignore_deb
-                or package.startswith(
-                    (
-                        "ibus",
-                        "im-",
-                        "language-",
-                        "lib",
-                        "gnome-",
-                        "ubuntu-",
-                        "yaru-",
-                        "xdg-",
-                    )
-                )
-            ):
-                continue
             name_match = re.search(r"^Name=(.+)$", text, re.MULTILINE)
-            name = name_match.group(1).strip() if name_match else package
-            version = self.runner.run(
-                ["dpkg-query", "-W", "-f=${Version}", package]
-            ).stdout.strip() or "?"
-            found[("APT", package)] = {
-                "category": "APT",
-                "package": package,
-                "name": name,
-                "version": version,
-            }
+            owner = self.runner.run(["dpkg-query", "-S", str(desktop_file)])
+            if owner.returncode == 0 and ":" in owner.stdout:
+                # APT-owned desktop file
+                package = owner.stdout.split(":", 1)[0].split(",", 1)[0]
+                if (
+                    package in known_deb
+                    or package in ignore_deb
+                    or package.startswith(
+                        (
+                            "ibus",
+                            "im-",
+                            "language-",
+                            "lib",
+                            "gnome-",
+                            "ubuntu-",
+                            "yaru-",
+                            "xdg-",
+                        )
+                    )
+                ):
+                    continue
+                name = name_match.group(1).strip() if name_match else package
+                version = self.runner.run(
+                    ["dpkg-query", "-W", "-f=${Version}", package]
+                ).stdout.strip() or "?"
+                metadata = self.runner.run(
+                    ["dpkg-query", "-W", "-f=${Section}\t${Homepage}", package]
+                ).stdout.strip()
+                section, _, homepage = metadata.partition("\t")
+                found[("APT", package)] = {
+                    "category": "APT",
+                    "package": package,
+                    "name": name,
+                    "version": version,
+                    "section": section,
+                    "homepage": homepage,
+                }
+            else:
+                # Standalone app: .desktop file not owned by any dpkg package
+                stem = desktop_file.stem
+                if stem in ignore_standalone:
+                    continue
+                exec_match = re.search(r"^Exec=(.+)$", text, re.MULTILINE)
+                if not exec_match:
+                    continue
+                exec_path = _extract_exec_path(exec_match.group(1))
+                if not exec_path:
+                    continue
+                name = name_match.group(1).strip() if name_match else stem
+                found[("Standalone", stem)] = {
+                    "category": "Standalone",
+                    "package": stem,
+                    "name": name,
+                    "version": "untracked",
+                }
 
         snap_list = self.runner.run(["snap", "list"])
         if snap_list.returncode == 0:
@@ -914,7 +1047,7 @@ class UpdateChecker:
             f"# Update Check Report — {now.strftime('%d/%m/%Y %H:%M:%S')}",
             "",
             "| Nguồn | Phần mềm | Hiện tại | Mới nhất | Trạng thái |",
-            "|---|---|---:|---:|---|",
+            "|---|---|---|---|---|",
         ]
         labels = {
             "ok": "✅ OK",
@@ -930,9 +1063,16 @@ class UpdateChecker:
         if discovered:
             lines.extend(["", "## Phần mềm phát hiện mới", ""])
             for item in discovered:
+                pkg = item['package']
                 lines.append(
                     f"- {item['category']}: **{item['name']}** "
-                    f"(`{item['package']}`, {item['version']})"
+                    f"(`{pkg}`, {item['version']})"
+                )
+                lines.append(
+                    f"  - Track: `check-all-updates --accept-discovery {pkg}:track`"
+                )
+                lines.append(
+                    f"  - Ignore: `check-all-updates --accept-discovery {pkg}:ignore`"
                 )
         if duplicates:
             lines.extend(["", "## Cài đặt trùng nguồn", ""])
@@ -941,6 +1081,24 @@ class UpdateChecker:
         if self.warnings:
             lines.extend(["", "## Cảnh báo", ""])
             lines.extend(f"- {warning}" for warning in self.warnings)
+        history_path = self.report_dir / "history.jsonl"
+        recommendations = build_recommendations(
+            results, discovered, duplicates, self.apps,
+            history_path=history_path if history_path.exists() else None,
+        )
+        if recommendations:
+            lines.extend(["", "## Khuyến nghị", ""])
+            lines.extend(recommendations)
+
+        # AI-assisted sections (optional, never crashes)
+        if self.ai_client:
+            try:
+                ai_lines = self._generate_ai_sections(results)
+                if ai_lines:
+                    lines.extend(["", "## 🤖 AI Analysis", ""])
+                    lines.extend(ai_lines)
+            except Exception as exc:
+                self.warn(f"AI analysis failed: {exc}")
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         temporary_link = self.report_dir / ".latest-report.tmp"
@@ -961,6 +1119,55 @@ class UpdateChecker:
         with (self.report_dir / "history.jsonl").open("a", encoding="utf-8") as history:
             history.write(json.dumps(history_record, ensure_ascii=False) + "\n")
         return report_path
+
+    def _generate_ai_sections(self, results: list[CheckResult]) -> list[str]:
+        """Generate AI-assisted changelog summaries and CVE lookups."""
+        import ai_client as _ai
+
+        lines: list[str] = []
+        updates = [r for r in results if r.status in {"update", "major"}]
+        ai_features = self.config.get("ai", {}).get("features", [])
+
+        # Changelog summaries
+        if "changelog" in ai_features:
+            for result in updates:
+                app = next(
+                    (a for a in self.apps if str(a["id"]) == result.app_id), None
+                )
+                if not app:
+                    continue
+                # Only works for GitHub-sourced apps (cached release has body)
+                repo = app.get("latest", {}).get("repo")
+                if not repo:
+                    continue
+                release = self.release_cache.get(repo)
+                if not release or not release.body:
+                    continue
+                self.progress(f"AI summarizing {result.name}…")
+                summary = _ai.summarize_release_notes(
+                    self.ai_client,
+                    result.name,
+                    result.current,
+                    result.latest,
+                    release.body,
+                )
+                if summary:
+                    lines.append(f"**{result.name}** ({result.current} → {result.latest}):")
+                    lines.append(summary)
+                    lines.append("")
+
+        # CVE lookups
+        if "cve" in ai_features:
+            for result in updates:
+                self.progress(f"AI checking CVE for {result.name}…")
+                cve_summary = _ai.lookup_cve_summary(
+                    self.ai_client, result.name, result.current
+                )
+                if cve_summary:
+                    lines.append(f"**{result.name}** CVE: {cve_summary}")
+                    lines.append("")
+
+        return lines
 
     def notify(self, results: list[CheckResult], report_path: Path) -> None:
         if shutil.which("notify-send") is None:
@@ -998,6 +1205,7 @@ def print_table(
     discovered: list[dict[str, str]],
     duplicates: list[dict[str, str]],
     warnings: list[str],
+    history_path: Path | None = None,
 ) -> None:
     summary = summarize(results)
     print(f"\nUpdate Checker v{VERSION}")
@@ -1018,7 +1226,10 @@ def print_table(
     if discovered:
         print("\nPhần mềm phát hiện mới:")
         for item in discovered:
-            print(f"- {item['category']}: {item['name']} ({item['package']})")
+            pkg = item['package']
+            print(f"- {item['category']}: {item['name']} ({pkg})")
+            print(f"    Track:  check-all-updates --accept-discovery {pkg}:track")
+            print(f"    Ignore: check-all-updates --accept-discovery {pkg}:ignore")
     if duplicates:
         print("\nCài đặt trùng nguồn:")
         for item in duplicates:
@@ -1027,6 +1238,13 @@ def print_table(
         print("\nCảnh báo:")
         for warning in warnings:
             print(f"- {warning}")
+    recommendations = build_recommendations(
+        results, discovered, duplicates, history_path=history_path,
+    )
+    if recommendations:
+        print("\nKhuyến nghị:")
+        for line in recommendations:
+            print(line)
 
 
 def print_plan(actions: list[Action]) -> None:
@@ -1048,6 +1266,7 @@ def json_payload(
     duplicates: list[dict[str, str]],
     warnings: list[str],
     report_path: Path,
+    history_path: Path | None = None,
 ) -> dict[str, Any]:
     return {
         "version": VERSION,
@@ -1057,8 +1276,263 @@ def json_payload(
         "discovered": discovered,
         "duplicates": duplicates,
         "warnings": warnings,
+        "recommendations": build_recommendations(
+            results, discovered, duplicates, history_path=history_path,
+        ),
         "report": str(report_path),
     }
+
+
+def _classify_priority(
+    result: CheckResult,
+) -> tuple[int, str, str]:
+    """Return (sort_key, emoji, label) for a result that needs updating."""
+    if result.status == "major" or result.app_id in HIGH_PRIORITY_IDS:
+        return (0, "🔴", "Ưu tiên cao")
+    if result.app_id in MEDIUM_PRIORITY_IDS:
+        return (1, "🟡", "Ưu tiên trung bình")
+    return (2, "🟢", "Ưu tiên thấp")
+
+
+def _update_command_hint(result: CheckResult, apps: list[dict[str, Any]] | None) -> str:
+    """Return a short CLI hint for updating *result*."""
+    app: dict[str, Any] | None = None
+    if apps:
+        for candidate in apps:
+            if str(candidate["id"]) == result.app_id:
+                app = candidate
+                break
+    if app is None:
+        return ""
+    spec = app["update"]
+    update_type = str(spec["type"])
+    if update_type == "apt":
+        return f"sudo apt-get install --only-upgrade -y {spec['package']}"
+    if update_type == "snap":
+        return f"sudo snap refresh {spec['package']}"
+    if update_type == "command":
+        return shlex.join([str(v) for v in spec["argv"]])
+    if update_type in {"github_deb", "github_zip_deb"}:
+        return "check-all-updates --apply"
+    if update_type == "manual":
+        return f"Cập nhật thủ công: {spec['url']}"
+    return ""
+
+
+def _parse_github_repo(url: str) -> str:
+    """Extract 'owner/repo' from a GitHub URL, or return empty string."""
+    match = re.match(
+        r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", url.strip()
+    )
+    return match.group(1) if match else ""
+
+
+def _classify_discovered(item: dict[str, str]) -> tuple[str, str]:
+    """Return (action_emoji, recommendation_text) for a discovered item."""
+    category = item.get("category", "")
+    section = item.get("section", "").rsplit("/", 1)[-1]  # "universe/utils" → "utils"
+    homepage = item.get("homepage", "")
+
+    if category == "Standalone":
+        return ("⚙️", "Nên thêm vào config.toml (standalone)")
+
+    if category == "Binary":
+        return ("❓", "Nên thêm vào config.toml hoặc ignore_local_bins")
+
+    if category in {"Snap", "AppImage"}:
+        return ("❓", f"Nên thêm vào config.toml hoặc ignore")
+
+    # APT packages: classify by section
+    if section in IGNORE_SECTIONS:
+        return ("🔇", f"Nên ignore (section: {section})")
+
+    # Input method frameworks
+    if section in {"utils", "kde", "misc"} and any(
+        keyword in item.get("package", "").lower()
+        for keyword in ("fcitx", "ibus", "scim", "uim", "input")
+    ):
+        return ("🔇", "Nên ignore (input method)")
+
+    if section in TRACK_SECTIONS:
+        if "github.com" in homepage:
+            repo = _parse_github_repo(homepage)
+            hint = f" — GitHub: {repo}" if repo else ""
+            return ("⚙️", f"Nên thêm config{hint}")
+        return ("⚙️", f"Nên thêm vào config.toml (section: {section})")
+
+    return ("❓", "Cần review thủ công")
+
+
+def _count_discovery_streak(
+    history_path: Path, n: int = 5,
+) -> dict[str, int]:
+    """Count consecutive appearances of each discovered package in last N runs.
+
+    Returns: {"fcitx5": 4, "antigravity-ide": 1, ...}
+    """
+    if not history_path.exists():
+        return {}
+    raw_lines = history_path.read_text(encoding="utf-8").splitlines()
+    recent = [line for line in raw_lines[-n:] if line.strip()]
+    if not recent:
+        return {}
+
+    # Build per-run sets of discovered package names
+    run_sets: list[set[str]] = []
+    for line in recent:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        discovered = record.get("discovered", [])
+        pkgs = {item.get("package", "") for item in discovered if item.get("package")}
+        run_sets.append(pkgs)
+
+    if not run_sets:
+        return {}
+
+    # Count streaks from latest run backward
+    latest_pkgs = run_sets[-1]
+    streaks: dict[str, int] = {}
+    for pkg in latest_pkgs:
+        count = 0
+        for run in reversed(run_sets):
+            if pkg in run:
+                count += 1
+            else:
+                break
+        streaks[pkg] = count
+    return streaks
+
+
+def _partition_discovered(
+    discovered: list[dict[str, str]],
+    streaks: dict[str, int],
+    threshold: int = 3,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Split discovered items into (new_items, muted_items).
+
+    new_items: streak < threshold (show in main table)
+    muted_items: streak >= threshold (show in collapsed section)
+    """
+    new_items: list[dict[str, str]] = []
+    muted_items: list[dict[str, str]] = []
+    for item in discovered:
+        pkg = item.get("package", "")
+        streak = streaks.get(pkg, 0)
+        section = item.get("section", "")
+        # Auto-mute IGNORE_SECTIONS items regardless of streak
+        base_section = section.rsplit("/", 1)[-1] if section else ""
+        if streak >= threshold or base_section in IGNORE_SECTIONS:
+            muted_items.append(item)
+        else:
+            new_items.append(item)
+    return new_items, muted_items
+
+
+def build_recommendations(
+    results: list[CheckResult],
+    discovered: list[dict[str, str]],
+    duplicates: list[dict[str, str]],
+    apps: list[dict[str, Any]] | None = None,
+    history_path: Path | None = None,
+) -> list[str]:
+    """Build recommendation lines for the report."""
+    updates = [r for r in results if r.status in {"update", "major"}]
+    if not updates and not discovered and not duplicates:
+        return []
+
+    lines: list[str] = []
+
+    if updates:
+        buckets: dict[str, list[CheckResult]] = {}
+        for result in updates:
+            _key, _emoji, label = _classify_priority(result)
+            buckets.setdefault(label, []).append(result)
+
+        priority_order = ["Ưu tiên cao", "Ưu tiên trung bình", "Ưu tiên thấp"]
+        emoji_map = {
+            "Ưu tiên cao": "🔴",
+            "Ưu tiên trung bình": "🟡",
+            "Ưu tiên thấp": "🟢",
+        }
+        for label in priority_order:
+            group = buckets.get(label)
+            if not group:
+                continue
+            lines.append(f"### {emoji_map[label]} {label}")
+            lines.append("")
+            for result in group:
+                lines.append(
+                    f"- **{result.name}** `{result.current}` → `{result.latest}`"
+                )
+            commands: list[str] = []
+            for result in group:
+                hint = _update_command_hint(result, apps)
+                if hint and hint not in commands:
+                    commands.append(hint)
+            if commands:
+                lines.append("")
+                lines.append("> ```")
+                for cmd in commands:
+                    lines.append(f"> {cmd}")
+                lines.append("> ```")
+            lines.append("")
+
+    if discovered:
+        # Partition into new vs muted based on history streaks
+        if history_path:
+            streaks = _count_discovery_streak(history_path)
+            new_items, muted_items = _partition_discovered(discovered, streaks)
+        else:
+            new_items, muted_items = discovered, []
+
+        if new_items:
+            lines.append("### 📦 Phần mềm phát hiện mới")
+            lines.append("")
+            lines.append("| Phần mềm | Package | Loại | Gợi ý | Xử lý |")
+            lines.append("|---|---|---|---|---|")
+            for item in new_items:
+                emoji, suggestion = _classify_discovered(item)
+                pkg = item.get("package", "")
+                category = item.get("category", "")
+                section = item.get("section", "")
+                if section:
+                    type_label = section.rsplit("/", 1)[-1]
+                else:
+                    type_label = category
+                lines.append(
+                    f"| {item['name']} | `{pkg}` | "
+                    f"{type_label} | {emoji} {suggestion} | "
+                    f"`check-all-updates --accept-discovery {pkg}:track` |"
+                )
+            lines.append("")
+
+        if muted_items:
+            lines.append("### 📋 Phần mềm đã biết (xuất hiện 3+ lần)")
+            lines.append("")
+            lines.append("| Package | Loại | Xử lý |")
+            lines.append("|---|---|---|")
+            for item in muted_items:
+                pkg = item.get("package", "")
+                cat = item.get("category", "")
+                lines.append(
+                    f"| `{pkg}` | {cat} | "
+                    f"`check-all-updates --accept-discovery {pkg}:track` |"
+                )
+            lines.append("")
+
+    if duplicates:
+        lines.append("### ⚠️ Cài đặt trùng nguồn")
+        lines.append("")
+        for item in duplicates:
+            lines.append(
+                f"- `{item['package']}` ({item['sources']}): "
+                f"gỡ bản không dùng để tránh xung đột"
+            )
+        lines.append("")
+
+    return lines
 
 
 def print_history(report_dir: Path, limit: int) -> int:
@@ -1089,6 +1563,205 @@ def acquire_lock(report_dir: Path) -> TextIO:
     handle.flush()
     return handle
 
+_IGNORE_KEY_MAP = {
+    "APT": "ignore_deb_packages",
+    "Standalone": "ignore_standalone",
+    "Binary": "ignore_local_bins",
+}
+
+_TRACK_TEMPLATE_APT = """\n# --- Added by --accept-discovery {timestamp} ---
+[[apps]]
+id = "{app_id}"
+name = "{name}"
+installed = {{ type = "dpkg", package = "{package}" }}
+latest = {{ type = "apt", package = "{package}" }}
+update = {{ type = "apt", package = "{package}" }}
+"""
+
+_TRACK_TEMPLATE_STANDALONE = """\n# --- Added by --accept-discovery {timestamp} ---
+# TODO: Fill in correct latest/update sources for {name}
+[[apps]]
+id = "{app_id}"
+name = "{name}"
+installed = {{ type = "command", argv = ["{exec_path}", "--version"], regex = "([0-9]+\\\\.[0-9]+\\\\.[0-9]+)" }}
+latest = {{ type = "github", repo = "OWNER/REPO" }}
+update = {{ type = "manual" }}
+"""
+
+
+def _insert_into_toml_array(text: str, section: str, key: str,
+                            value: str) -> str:
+    """Insert a value into a TOML array within a section, preserving format.
+
+    Handles: existing array with items, empty array, missing key, missing section.
+    """
+    quoted = f'  "{value}"'
+    # Try to find the key within the section
+    # Pattern: key = [... ] possibly multiline
+    section_pattern = re.compile(
+        rf"^\[{re.escape(section)}\]\s*$", re.MULTILINE
+    )
+    section_match = section_pattern.search(text)
+    if not section_match:
+        # Section doesn't exist — append both section and key
+        return text.rstrip() + f"\n\n[{section}]\n{key} = [\n{quoted},\n]\n"
+
+    # Find the key within this section (before next section or EOF)
+    section_start = section_match.end()
+    next_section = re.search(r"^\[", text[section_start:], re.MULTILINE)
+    section_end = section_start + next_section.start() if next_section else len(text)
+    section_text = text[section_start:section_end]
+
+    # Look for key = [...] pattern
+    key_pattern = re.compile(
+        rf"^({re.escape(key)}\s*=\s*\[)(.*?)(\])",
+        re.MULTILINE | re.DOTALL,
+    )
+    key_match = key_pattern.search(section_text)
+    if not key_match:
+        # Key doesn't exist — insert after section header
+        insert_pos = section_start
+        # Skip to end of section header line
+        newline = text.find("\n", section_start)
+        if newline != -1:
+            insert_pos = newline + 1
+        return (
+            text[:insert_pos]
+            + f"{key} = [\n{quoted},\n]\n"
+            + text[insert_pos:]
+        )
+
+    # Key exists — insert value before closing bracket
+    abs_start = section_start + key_match.start()
+    abs_end = section_start + key_match.end()
+    existing = key_match.group(2).strip()
+    if existing:
+        # Non-empty array: insert before closing ]
+        close_bracket_pos = section_start + key_match.start(3)
+        before = text[:close_bracket_pos].rstrip()
+        # Strip trailing comma to avoid double comma
+        if before.endswith(","):
+            before = before[:-1]
+        return (
+            before
+            + f",\n{quoted},\n"
+            + text[close_bracket_pos:]
+        )
+    else:
+        # Empty array: key = []
+        return (
+            text[:abs_start]
+            + f"{key} = [\n{quoted},\n]"
+            + text[abs_end:]
+        )
+
+
+def _accept_discovery(config_path: Path, spec: str, report_dir: Path,
+                      yes: bool = False, ai_client: Any | None = None) -> int:
+    """Process --accept-discovery <id>:<track|ignore>.
+
+    Reads the latest history entry to find the discovered app metadata,
+    then modifies config.toml accordingly.
+    """
+    if ":" not in spec:
+        raise ConfigError(
+            f"invalid format: '{spec}' — expected id:track or id:ignore"
+        )
+    app_id, _, action = spec.partition(":")
+    if action not in ("track", "ignore"):
+        raise ConfigError(
+            f"unknown action: '{action}' — expected 'track' or 'ignore'"
+        )
+
+    # Find app in latest history
+    history_path = report_dir / "history.jsonl"
+    if not history_path.exists():
+        raise ConfigError(
+            "no history found — run check-all-updates first"
+        )
+    last_line = ""
+    with history_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                last_line = line
+    if not last_line:
+        raise ConfigError("history file is empty")
+    record = json.loads(last_line)
+    discovered = record.get("discovered", [])
+    match = None
+    for item in discovered:
+        if item.get("package") == app_id:
+            match = item
+            break
+    if match is None:
+        raise ConfigError(
+            f"'{app_id}' not found in latest discovery "
+            f"({len(discovered)} items). Run check-all-updates first."
+        )
+
+    # Read config
+    if not config_path.exists():
+        raise ConfigError(f"config not found: {config_path}")
+    original = config_path.read_text(encoding="utf-8")
+
+    category = match.get("category", "APT")
+    name = match.get("name", app_id)
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if action == "ignore":
+        ignore_key = _IGNORE_KEY_MAP.get(category, "ignore_deb_packages")
+        modified = _insert_into_toml_array(original, "discovery", ignore_key, app_id)
+    else:  # track
+        ai_generated = None
+        if ai_client:
+            try:
+                import ai_client as _ai
+                ai_generated = _ai.generate_app_config(ai_client, match)
+            except Exception:
+                ai_generated = None
+
+        if ai_generated:
+            block = f"\n# --- Added by --accept-discovery (AI) {now} ---\n" + ai_generated.strip() + "\n"
+        else:
+            package = match.get("package", app_id)
+            if category == "APT":
+                block = _TRACK_TEMPLATE_APT.format(
+                    timestamp=now, app_id=app_id, name=name, package=package,
+                )
+            else:
+                exec_path = f"/opt/{app_id}/{app_id}"
+                block = _TRACK_TEMPLATE_STANDALONE.format(
+                    timestamp=now, app_id=app_id, name=name, exec_path=exec_path,
+                )
+        modified = original.rstrip() + "\n" + block
+
+    # Show diff preview
+    if not yes:
+        print(f"\n--- {config_path} (before)")
+        print(f"+++ {config_path} (after)")
+        orig_lines = original.splitlines(keepends=True)
+        mod_lines = modified.splitlines(keepends=True)
+        diff = difflib.unified_diff(orig_lines, mod_lines, lineterm="")
+        for line in diff:
+            print(line, end="")
+        print()
+        try:
+            confirm = input("Apply changes? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return 1
+        if confirm != "y":
+            print("Cancelled.")
+            return 1
+
+    # Backup and write
+    backup = config_path.with_suffix(".toml.bak")
+    shutil.copy2(config_path, backup)
+    config_path.write_text(modified, encoding="utf-8")
+    print(f"✅ Config updated: {action} {app_id}")
+    print(f"   Backup: {backup}")
+    return 0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1104,6 +1777,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notify", action="store_true", help="send desktop notification")
     parser.add_argument("--no-discovery", action="store_true", help="skip discovery")
     parser.add_argument("--history", nargs="?", const=10, type=int, metavar="N")
+    parser.add_argument(
+        "--accept-discovery", metavar="ID:ACTION",
+        help="accept discovered app (id:track or id:ignore)",
+    )
+    parser.add_argument("--ai", action="store_true", help="enable AI-assisted analysis")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -1115,14 +1793,34 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--apply cannot be combined with --json")
     if args.apply and args.dry_run:
         parser.error("--apply cannot be combined with --dry-run")
-    if args.yes and not args.apply:
+    if args.yes and not args.apply and not args.accept_discovery:
         parser.error("--yes requires --apply")
 
     try:
         config = load_config(args.config.expanduser())
         checker = UpdateChecker(config, quiet=args.json)
+        # Init AI client if requested and configured
+        if args.ai:
+            ai_config = config.get("ai", {})
+            if not ai_config.get("enabled"):
+                checker.warn("--ai flag used but [ai] section not enabled in config")
+            else:
+                try:
+                    import ai_client as _ai
+                    checker.ai_client = _ai.create_client(ai_config)
+                    if checker.ai_client:
+                        checker.progress("AI client initialized")
+                except ImportError:
+                    checker.warn("ai_client module not found")
+
         if args.history is not None:
             return print_history(checker.report_dir, max(1, args.history))
+        if args.accept_discovery:
+            return _accept_discovery(
+                args.config.expanduser(), args.accept_discovery,
+                checker.report_dir, yes=args.yes or False,
+                ai_client=checker.ai_client,
+            )
 
         with acquire_lock(checker.report_dir):
             if not args.quick:
@@ -1135,6 +1833,9 @@ def main(argv: list[str] | None = None) -> int:
             report_path = checker.save_outputs(results, discovered, duplicates)
             actions = checker.build_actions(results)
 
+            history_path = checker.report_dir / "history.jsonl"
+            hp = history_path if history_path.exists() else None
+
             if args.json:
                 print(
                     json.dumps(
@@ -1144,13 +1845,17 @@ def main(argv: list[str] | None = None) -> int:
                             duplicates,
                             checker.warnings,
                             report_path,
+                            history_path=hp,
                         ),
                         ensure_ascii=False,
                         indent=2,
                     )
                 )
             else:
-                print_table(results, discovered, duplicates, checker.warnings)
+                print_table(
+                    results, discovered, duplicates, checker.warnings,
+                    history_path=hp,
+                )
 
             if args.dry_run:
                 print_plan(actions)

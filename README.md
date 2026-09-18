@@ -11,7 +11,7 @@
 
 ## ✨ Features
 
-- **Multi-Source Inventory Tracking**: Monitors software from **APT**, **Snap**, **GitHub Releases**, **npm**, **Standalone CLI binaries**, and **AppImage**.
+- **Multi-Source Inventory Tracking**: Monitors software from **APT**, **Snap**, **GitHub Releases**, **npm**, **Standalone CLI binaries**, **AppImage**, and **HTTP scrape endpoints**.
 - **Verified GitHub Updates**: Automatically downloads GitHub release assets (e.g. RustDesk, Flameshot), verifies SHA-256 hashes, extracts inner archive checksums, validates `.deb` metadata with `dpkg-deb`, and installs cleanly via `apt`.
 - **Zero Third-Party Python Dependencies**: Built entirely using Python 3.12 standard library and native OS tools (`dpkg`, `apt`, `snap`, `7z`, `systemd`, `notify-send`).
 - **Safe Execution & Fail-Closed Design**:
@@ -19,8 +19,17 @@
   - Verification checks require the post-update installed version to match or exceed the target version.
   - Interactive confirmation prompts for `--apply` mode, failing closed in non-interactive sessions unless `--yes` is specified.
   - File locking prevents concurrent update checker instances.
+- **Smart Auto-Discovery & Management**:
+  - Scans system `.desktop` entries and local binaries with wrapper support (`env VAR=...`, `sh -c`, `/usr/bin/env`).
+  - CLI management via `--accept-discovery <id>:<track|ignore>`: automatically edits `config.toml` (safe array insertion & skeleton generation), creates `.bak` backups, and shows unified diff preview.
+  - Noise reduction / soft muting: separates frequently recurring items (3+ appearances) and system sections (`libs`, `debug`, `fonts`) into a collapsed list.
+- **Optional AI-Assisted Intelligence (`--ai`)**:
+  - Zero external dependencies: uses stdlib `urllib.request` + `json` to integrate with **DeepSeek**, **Google Gemini**, **Groq**, or **OpenAI**.
+  - Automated Vietnamese changelog summaries for GitHub releases.
+  - CVE vulnerability lookup & severity rating via `cve.circl.lu`.
+  - Local JSON caching (7-day TTL) for high speed and minimal token usage.
+  - Fail-open design: gracefully falls back if API keys are missing or offline.
 - **Automation-Friendly**: Clean JSON output (`--json`) for scripting/piping into `jq` or external dashboards.
-- **Auto-Discovery**: Scans system `.desktop` entries and local binaries to discover untracked installed software.
 - **Systemd User Timer & Desktop Notifications**: Native background checks at scheduled times with desktop alert popups.
 
 ---
@@ -30,11 +39,13 @@
 ```text
 meta-update/
 ├── bin/                 # Executable entry point (check-all-updates launcher)
-├── config/              # TOML software inventory definition (config.toml)
-├── src/                 # Python 3.12 core engine (update_checker.py)
-├── systemd/             # Systemd user service & timer unit files
-├── tests/               # Unit test suite (test_update_checker.py)
-└── docs/                # Detailed operational guides and implementation notes
+├── src/                 # Python 3.12 core engine
+│   ├── update_checker.py # Core update checking & discovery engine
+│   └── ai_client.py     # Lightweight stdlib AI adapter (DeepSeek/Gemini/OpenAI)
+├── tests/               # Unit test suite
+│   ├── test_update_checker.py
+│   └── test_ai_client.py
+└── docs/                # Detailed operational guides and architecture notes
 ```
 
 ---
@@ -58,6 +69,13 @@ Clone the repository and run directly without installation:
 # Perform a full check (refreshes APT cache if non-interactive sudo is active)
 ./bin/check-all-updates
 
+# Run with optional AI analysis (changelog summary & CVE check)
+./bin/check-all-updates --quick --ai
+
+# Accept or ignore a newly discovered app directly from CLI
+./bin/check-all-updates --accept-discovery fcitx5:ignore
+./bin/check-all-updates --accept-discovery myapp:track
+
 # Output machine-readable JSON
 ./bin/check-all-updates --quick --json
 
@@ -77,8 +95,7 @@ mkdir -p ~/.local/bin ~/.local/lib/update-checker ~/.config/update-checker
 
 # Copy core files
 cp bin/check-all-updates ~/.local/bin/
-cp src/update_checker.py ~/.local/lib/update-checker/
-cp config/config.toml ~/.config/update-checker/
+cp src/update_checker.py src/ai_client.py ~/.local/lib/update-checker/
 chmod +x ~/.local/bin/check-all-updates
 ```
 
@@ -104,12 +121,27 @@ systemctl --user list-timers update-checker.timer
 
 ## ⚙️ Configuration (`config.toml`)
 
-Applications are configured in `~/.config/update-checker/config.toml`. Each entry specifies how to detect the installed version, fetch the latest version, and perform updates:
+Applications and optional AI settings are configured in `~/.config/update-checker/config.toml`:
 
 ```toml
 schema_version = 1
 report_dir = "~/.local/share/update-checker"
 github_token_env = "GITHUB_TOKEN"
+
+[discovery]
+enabled = true
+appimage_dirs = ["~/Apps", "~/Applications", "~/Desktop"]
+ignore_deb_packages = ["fcitx5", "totem", "yelp"]
+ignore_local_bins = ["python3", "7zz"]
+
+# --- AI-Assisted Analysis (Optional) ---
+[ai]
+enabled = false                    # Set to true to activate
+provider = "deepseek"              # deepseek, openai, groq, gemini
+api_key_env = "DEEPSEEK_API_KEY"   # Name of environment variable holding API key
+model = "deepseek-chat"            # e.g., deepseek-chat, gemini-2.5-flash
+timeout_seconds = 10
+features = ["changelog", "cve"]    # changelog: release notes, cve: CVE lookup
 
 [[apps]]
 id = "google-chrome"
@@ -137,7 +169,7 @@ update = {
 | Role | Supported Adapters |
 |---|---|
 | **Installed Detection** | `dpkg`, `snap`, `command`, `json_file`, `appimage_asar` |
-| **Latest Lookup** | `apt`, `snap`, `npm`, `github` |
+| **Latest Lookup** | `apt`, `snap`, `npm`, `github`, `http_scrape` |
 | **Update Mechanism** | `apt`, `snap`, `command`, `github_deb`, `github_zip_deb`, `manual` |
 
 ---
@@ -147,35 +179,32 @@ update = {
 ```text
 usage: check-all-updates [-h] [--config PATH] [--quick] [--json] [--apply] [--yes]
                          [--dry-run] [--notify] [--no-discovery] [--history [N]]
+                         [--accept-discovery ID:ACTION] [--ai] [--version]
 
 Options:
-  --config PATH   Path to TOML config file (default: ~/.config/update-checker/config.toml)
-  --quick         Skip APT metadata refresh (fast execution)
-  --json          Output clean JSON payload to stdout
-  --dry-run       Display proposed update commands without executing
-  --apply         Sequentially execute automatic updates
-  --yes           Skip confirmation prompt (required for non-interactive --apply)
-  --notify        Send desktop notification via notify-send
-  --no-discovery  Skip scanning for untracked desktop apps/binaries
-  --history [N]   View recent check execution history log
+  --config PATH                 Path to TOML config file (default: ~/.config/update-checker/config.toml)
+  --quick                       Skip APT metadata refresh (fast execution)
+  --json                        Output clean JSON payload to stdout
+  --dry-run                     Display proposed update commands without executing
+  --apply                       Sequentially execute automatic updates
+  --yes                         Skip confirmation prompt (required for non-interactive --apply)
+  --notify                      Send desktop notification via notify-send
+  --no-discovery                Skip scanning for untracked desktop apps/binaries
+  --history [N]                 View recent check execution history log
+  --accept-discovery ID:ACTION  Accept discovered app into config (id:track or id:ignore)
+  --ai                          Enable AI-assisted analysis (release summaries & CVE lookup)
+  --version                     Show program's version number and exit
 ```
 
 ---
 
 ## 🧪 Testing
 
-Run the built-in unit test suite:
+Run the built-in unit test suite (80+ test cases covering parsing, discovery, CLI actions, and AI adapters):
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-
----
-
-## 📘 Documentation
-
-- [Hướng dẫn sử dụng chi tiết (Vietnamese Usage Guide)](docs/Hướng-dẫn-check-all-updates.md)
-- [Implementation Summary](docs/implementation-summary.md)
 
 ---
 

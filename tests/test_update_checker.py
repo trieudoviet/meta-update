@@ -13,6 +13,8 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIB_DIR = PROJECT_ROOT / "src"
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
+if not CONFIG_PATH.exists():
+    CONFIG_PATH = Path("~/.config/update-checker/config.toml").expanduser()
 sys.path.insert(0, str(LIB_DIR))
 
 import update_checker as uc  # noqa: E402
@@ -43,7 +45,9 @@ class FakeHttp:
         self.payload = payload
         self.text = text
 
-    def get_json(self, _url):
+    def get_json(self, url):
+        if isinstance(self.payload, dict) and url in self.payload:
+            return self.payload[url]
         return self.payload
 
     def get_text(self, _url):
@@ -213,6 +217,62 @@ class AssetSelectionTests(unittest.TestCase):
         _release, asset = checker.select_github_asset(action)
         self.assertIn("ubuntu-24.04-amd64", asset["name"])
 
+    def test_fallback_to_recent_release_when_latest_has_no_matching_asset(self):
+        app = {
+            "id": "obsidian",
+            "name": "Obsidian",
+            "installed": {"type": "dpkg", "package": "obsidian"},
+            "latest": {"type": "github", "repo": "obsidianmd/obsidian-releases"},
+            "update": {
+                "type": "github_deb",
+                "repo": "obsidianmd/obsidian-releases",
+                "package": "obsidian",
+                "asset_regex": r"^obsidian_{version}_amd64\.deb$",
+            },
+        }
+        url_latest = "https://api.github.com/repos/obsidianmd/obsidian-releases/releases/latest"
+        url_releases = "https://api.github.com/repos/obsidianmd/obsidian-releases/releases?per_page=10"
+        payloads = {
+            url_latest: {
+                "tag_name": "v1.13.8",
+                "html_url": "https://github.com/obsidianmd/obsidian-releases/releases/tag/v1.13.8",
+                "assets": [{"name": "Obsidian-1.13.8.apk"}],
+            },
+            url_releases: [
+                {
+                    "tag_name": "v1.13.8",
+                    "html_url": "https://github.com/obsidianmd/obsidian-releases/releases/tag/v1.13.8",
+                    "assets": [{"name": "Obsidian-1.13.8.apk"}],
+                },
+                {
+                    "tag_name": "v1.13.7",
+                    "html_url": "https://github.com/obsidianmd/obsidian-releases/releases/tag/v1.13.7",
+                    "assets": [
+                        {"name": "Obsidian-1.13.7.apk"},
+                        {"name": "obsidian_1.13.7_amd64.deb"},
+                    ],
+                },
+            ],
+        }
+        checker = uc.UpdateChecker(
+            minimal_config([app]),
+            runner=FakeRunner(),
+            http=FakeHttp(payloads),
+            quiet=True,
+        )
+        # Check latest version resolves to 1.13.7 (not 1.13.8)
+        latest_ver = checker.latest_version(app, "1.13.7")
+        self.assertEqual(latest_ver, "1.13.7")
+
+        # Check select_github_asset picks obsidian_1.13.7_amd64.deb
+        result = uc.CheckResult(
+            "obsidian", "Obsidian", "GITHUB", "1.13.4", "1.13.7", "update", "github_deb"
+        )
+        action = checker.build_actions([result])[0]
+        release, asset = checker.select_github_asset(action)
+        self.assertEqual(release.version, "1.13.7")
+        self.assertEqual(asset["name"], "obsidian_1.13.7_amd64.deb")
+
 
 class SafetyAndOutputTests(unittest.TestCase):
     def setUp(self):
@@ -299,6 +359,505 @@ class HttpScrapeLatestTests(unittest.TestCase):
         checker = self.make_checker("<html>no winbox link here</html>")
         with self.assertRaises(uc.UpdateError):
             checker.latest_version(checker.apps[0], "4.3")
+
+
+class RecommendationTests(unittest.TestCase):
+    def _result(self, app_id, name, status, category="APT", update_type="apt"):
+        return uc.CheckResult(
+            app_id=app_id,
+            name=name,
+            category=category,
+            current="1.0",
+            latest="2.0",
+            status=status,
+            update_type=update_type,
+        )
+
+    def test_high_priority_for_browser(self):
+        result = self._result("google-chrome", "Google Chrome", "update")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên cao", text)
+        self.assertIn("Google Chrome", text)
+
+    def test_medium_priority_for_dev_tool(self):
+        result = self._result("cursor", "Cursor", "update")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên trung bình", text)
+
+    def test_low_priority_for_unknown_app(self):
+        result = self._result("gimp", "GIMP", "update")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên thấp", text)
+
+    def test_major_update_promoted_to_high(self):
+        result = self._result("gimp", "GIMP", "major")
+        lines = uc.build_recommendations([result], [], [])
+        text = "\n".join(lines)
+        self.assertIn("Ưu tiên cao", text)
+        self.assertNotIn("Ưu tiên thấp", text)
+
+    def test_discovery_suggestions(self):
+        discovered = [
+            {
+                "category": "APT", "package": "fcitx5", "name": "Fcitx 5",
+                "version": "5.1", "section": "universe/utils",
+                "homepage": "https://github.com/fcitx/fcitx5",
+            },
+        ]
+        lines = uc.build_recommendations([], discovered, [])
+        text = "\n".join(lines)
+        self.assertIn("Phần mềm phát hiện mới", text)
+        self.assertIn("fcitx5", text)
+        self.assertIn("Nên ignore", text)
+        self.assertIn("input method", text)
+
+    def test_binary_discovery_suggests_ignore_local_bins(self):
+        discovered = [
+            {"category": "Binary", "package": "mytool", "name": "mytool", "version": "untracked"},
+        ]
+        lines = uc.build_recommendations([], discovered, [])
+        text = "\n".join(lines)
+        self.assertIn("ignore_local_bins", text)
+
+    def test_duplicate_suggestions(self):
+        duplicates = [{"package": "discord", "sources": "APT + Snap"}]
+        lines = uc.build_recommendations([], [], duplicates)
+        text = "\n".join(lines)
+        self.assertIn("trùng nguồn", text)
+        self.assertIn("discord", text)
+
+    def test_no_updates_returns_empty(self):
+        ok_result = self._result("gimp", "GIMP", "ok")
+        lines = uc.build_recommendations([ok_result], [], [])
+        self.assertEqual(lines, [])
+
+    def test_command_hints_with_apps(self):
+        apps = [
+            {
+                "id": "cursor",
+                "name": "Cursor",
+                "installed": {"type": "dpkg", "package": "cursor"},
+                "latest": {"type": "apt", "package": "cursor"},
+                "update": {"type": "apt", "package": "cursor"},
+            }
+        ]
+        result = self._result("cursor", "Cursor", "update")
+        lines = uc.build_recommendations([result], [], [], apps=apps)
+        text = "\n".join(lines)
+        self.assertIn("sudo apt-get install --only-upgrade -y cursor", text)
+
+    def test_snap_command_hint(self):
+        apps = [
+            {
+                "id": "firefox",
+                "name": "Firefox",
+                "installed": {"type": "snap", "package": "firefox"},
+                "latest": {"type": "snap", "package": "firefox"},
+                "update": {"type": "snap", "package": "firefox"},
+            }
+        ]
+        result = self._result("firefox", "Firefox", "update", category="SNAP", update_type="snap")
+        lines = uc.build_recommendations([result], [], [], apps=apps)
+        text = "\n".join(lines)
+        self.assertIn("sudo snap refresh firefox", text)
+
+    def test_github_deb_hint(self):
+        apps = [
+            {
+                "id": "obsidian",
+                "name": "Obsidian",
+                "installed": {"type": "dpkg", "package": "obsidian"},
+                "latest": {"type": "github", "repo": "obsidianmd/obsidian-releases"},
+                "update": {
+                    "type": "github_deb",
+                    "repo": "obsidianmd/obsidian-releases",
+                    "package": "obsidian",
+                    "asset_regex": "^obsidian_{version}_amd64\\.deb$",
+                },
+            }
+        ]
+        result = self._result(
+            "obsidian", "Obsidian", "update", category="GITHUB", update_type="github_deb"
+        )
+        lines = uc.build_recommendations([result], [], [], apps=apps)
+        text = "\n".join(lines)
+        self.assertIn("check-all-updates --apply", text)
+
+class DiscoveryClassificationTests(unittest.TestCase):
+    def test_classify_standalone_recommends_track(self):
+        item = {"category": "Standalone", "package": "antigravity-ide", "name": "Antigravity IDE"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "⚙️")
+        self.assertIn("config.toml", text)
+        self.assertIn("standalone", text)
+
+    def test_classify_ignore_section_libs(self):
+        item = {"category": "APT", "package": "libfoo", "section": "libs"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "🔇")
+        self.assertIn("ignore", text)
+
+    def test_classify_track_section_devel(self):
+        item = {
+            "category": "APT", "package": "myeditor",
+            "section": "devel", "homepage": "https://example.com",
+        }
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "⚙️")
+        self.assertIn("config.toml", text)
+
+    def test_classify_track_github_homepage(self):
+        item = {
+            "category": "APT", "package": "coolapp",
+            "section": "web", "homepage": "https://github.com/owner/coolapp",
+        }
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "⚙️")
+        self.assertIn("owner/coolapp", text)
+
+    def test_classify_input_method_ignored(self):
+        item = {
+            "category": "APT", "package": "fcitx5",
+            "section": "universe/utils", "homepage": "",
+        }
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "🔇")
+        self.assertIn("input method", text)
+
+    def test_classify_binary_suggests_review(self):
+        item = {"category": "Binary", "package": "mytool"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "❓")
+        self.assertIn("ignore_local_bins", text)
+
+    def test_classify_unknown_section_needs_review(self):
+        item = {"category": "APT", "package": "weirdpkg", "section": "alien"}
+        emoji, text = uc._classify_discovered(item)
+        self.assertEqual(emoji, "❓")
+        self.assertIn("review", text)
+
+    def test_parse_github_repo_valid(self):
+        self.assertEqual(uc._parse_github_repo("https://github.com/fcitx/fcitx5"), "fcitx/fcitx5")
+        self.assertEqual(uc._parse_github_repo("https://github.com/owner/repo.git"), "owner/repo")
+        self.assertEqual(uc._parse_github_repo("https://github.com/a/b/"), "a/b")
+
+    def test_parse_github_repo_invalid(self):
+        self.assertEqual(uc._parse_github_repo("https://example.com/foo"), "")
+        self.assertEqual(uc._parse_github_repo(""), "")
+        self.assertEqual(uc._parse_github_repo("https://github.com/only-owner"), "")
+
+    def test_discovery_table_has_type_column(self):
+        discovered = [
+            {
+                "category": "APT", "package": "gimp-extra",
+                "name": "GIMP Extra", "version": "1.0",
+                "section": "graphics", "homepage": "",
+            },
+            {
+                "category": "Standalone", "package": "antigravity-ide",
+                "name": "Antigravity IDE", "version": "untracked",
+            },
+        ]
+        lines = uc.build_recommendations([], discovered, [])
+        text = "\n".join(lines)
+        # Table header includes Loại column
+        self.assertIn("| Loại |", text)
+        # APT item shows section as type
+        self.assertIn("graphics", text)
+        # Standalone item shows category as type
+        self.assertIn("Standalone", text)
+        self.assertIn("⚙️", text)
+
+
+class ExecParsingTests(unittest.TestCase):
+    def test_extract_env_wrapper(self):
+        """env VAR=VALUE /opt/app should extract /opt/app."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "env XDG_SESSION_TYPE=X11 /opt/expressvpn/bin/expressvpn-client %u"
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/expressvpn/bin/expressvpn-client")
+
+    def test_extract_usr_bin_env(self):
+        """/usr/bin/env python3 /path/to/script should extract /path/to/script."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "/usr/bin/env python3 /path/to/script.py"
+            )
+        # python3 is not absolute, next token /path/to/script.py would be checked
+        # but since env skips VAR=VALUE only, python3 is the candidate — not absolute
+        self.assertIsNone(result)
+
+    def test_extract_env_absolute_binary(self):
+        """env /opt/app should extract /opt/app."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path("env /opt/myapp/bin/myapp")
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/myapp/bin/myapp")
+
+    def test_extract_sh_c(self):
+        """sh -c '/opt/app --flag' should extract /opt/app."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path('sh -c "/opt/custom/app --flag"')
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/custom/app")
+
+    def test_extract_direct_path(self):
+        """Direct absolute path with flags and field codes."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "/opt/antigravity-ide/antigravity-ide --ozone-platform=x11 %F"
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/antigravity-ide/antigravity-ide")
+
+    def test_extract_bare_command(self):
+        """Bare command (not absolute) returns None."""
+        result = uc._extract_exec_path("firefox %u")
+        self.assertIsNone(result)
+
+    def test_extract_empty_string(self):
+        """Empty string returns None."""
+        result = uc._extract_exec_path("")
+        self.assertIsNone(result)
+
+    def test_extract_malformed_quotes(self):
+        """Unclosed quote returns None (shlex.split raises ValueError)."""
+        result = uc._extract_exec_path('sh -c "/unclosed')
+        self.assertIsNone(result)
+
+    def test_extract_field_codes_removed(self):
+        """Field codes like %f %F %u %U are stripped before parsing."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path("/opt/app %f %F %u %U %i %c %k")
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/app")
+
+    def test_extract_env_multiple_vars(self):
+        """env with multiple VAR=VALUE pairs."""
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            result = uc._extract_exec_path(
+                "env GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb /opt/app/run"
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result), "/opt/app/run")
+
+    def test_extract_nonexistent_path(self):
+        """Absolute path that doesn't exist returns None."""
+        result = uc._extract_exec_path("/nonexistent/path/to/binary")
+        self.assertIsNone(result)
+
+
+class TomlArrayInsertTests(unittest.TestCase):
+    def test_insert_into_existing_array(self):
+        text = '[discovery]\nignore_deb_packages = [\n  "existing",\n]\n'
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_deb_packages", "new-pkg")
+        self.assertIn('"existing"', result)
+        self.assertIn('"new-pkg"', result)
+
+    def test_insert_into_empty_array(self):
+        text = "[discovery]\nignore_deb_packages = []\n"
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_deb_packages", "new-pkg")
+        self.assertIn('"new-pkg"', result)
+
+    def test_insert_missing_key(self):
+        text = "[discovery]\nenabled = true\n"
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_standalone", "my-app")
+        self.assertIn('ignore_standalone = [', result)
+        self.assertIn('"my-app"', result)
+        self.assertIn("enabled = true", result)
+
+    def test_insert_missing_section(self):
+        text = "schema_version = 1\n\n[[apps]]\nid = \"test\"\n"
+        result = uc._insert_into_toml_array(text, "discovery", "ignore_deb_packages", "pkg")
+        self.assertIn("[discovery]", result)
+        self.assertIn('"pkg"', result)
+        self.assertIn('id = "test"', result)  # existing content preserved
+
+
+class AcceptDiscoveryTests(unittest.TestCase):
+    def _setup_env(self, discovered, config_text=None):
+        """Create temp config and history files, return (config_path, report_dir)."""
+        tmpdir = tempfile.mkdtemp()
+        config_path = Path(tmpdir) / "config.toml"
+        report_dir = Path(tmpdir) / "reports"
+        report_dir.mkdir()
+        if config_text is None:
+            config_text = (
+                'schema_version = 1\n\n'
+                '[discovery]\n'
+                'ignore_deb_packages = [\n  "existing",\n]\n'
+            )
+        config_path.write_text(config_text, encoding="utf-8")
+        history_path = report_dir / "history.jsonl"
+        record = {"timestamp": "2026-08-18T10:00:00", "discovered": discovered}
+        history_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return config_path, report_dir
+
+    def test_ignore_adds_to_array(self):
+        discovered = [{"category": "APT", "package": "fcitx5", "name": "Fcitx 5"}]
+        config_path, report_dir = self._setup_env(discovered)
+        rc = uc._accept_discovery(config_path, "fcitx5:ignore", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn('"fcitx5"', content)
+        self.assertIn('"existing"', content)  # preserved
+
+    def test_ignore_standalone_uses_correct_key(self):
+        discovered = [{"category": "Standalone", "package": "myapp", "name": "My App"}]
+        config_text = "[discovery]\nenabled = true\n"
+        config_path, report_dir = self._setup_env(discovered, config_text)
+        rc = uc._accept_discovery(config_path, "myapp:ignore", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn("ignore_standalone", content)
+        self.assertIn('"myapp"', content)
+
+    def test_track_apt_appends_block(self):
+        discovered = [{"category": "APT", "package": "coolapp", "name": "Cool App"}]
+        config_path, report_dir = self._setup_env(discovered)
+        rc = uc._accept_discovery(config_path, "coolapp:track", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn('[[apps]]', content)
+        self.assertIn('id = "coolapp"', content)
+        self.assertIn('name = "Cool App"', content)
+        self.assertIn("type = \"apt\"", content)
+
+    def test_track_standalone_appends_manual(self):
+        discovered = [{"category": "Standalone", "package": "ide", "name": "IDE App"}]
+        config_path, report_dir = self._setup_env(discovered)
+        rc = uc._accept_discovery(config_path, "ide:track", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertIn('[[apps]]', content)
+        self.assertIn('id = "ide"', content)
+        self.assertIn('type = "manual"', content)
+        self.assertIn("TODO", content)
+
+    def test_backup_created(self):
+        discovered = [{"category": "APT", "package": "pkg", "name": "Pkg"}]
+        config_path, report_dir = self._setup_env(discovered)
+        uc._accept_discovery(config_path, "pkg:ignore", report_dir, yes=True)
+        backup = config_path.with_suffix(".toml.bak")
+        self.assertTrue(backup.exists())
+
+    def test_invalid_action_raises(self):
+        discovered = [{"category": "APT", "package": "pkg", "name": "Pkg"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with self.assertRaises(uc.ConfigError) as ctx:
+            uc._accept_discovery(config_path, "pkg:delete", report_dir, yes=True)
+        self.assertIn("delete", str(ctx.exception))
+
+    def test_invalid_format_raises(self):
+        config_path, report_dir = self._setup_env([])
+        with self.assertRaises(uc.ConfigError) as ctx:
+            uc._accept_discovery(config_path, "no-colon", report_dir, yes=True)
+        self.assertIn("invalid format", str(ctx.exception))
+
+    def test_unknown_id_raises(self):
+        discovered = [{"category": "APT", "package": "other", "name": "Other"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with self.assertRaises(uc.ConfigError) as ctx:
+            uc._accept_discovery(config_path, "missing:ignore", report_dir, yes=True)
+        self.assertIn("not found", str(ctx.exception))
+
+
+
+class SoftMuteTests(unittest.TestCase):
+    def _write_history(self, runs: list[list[str]]) -> Path:
+        """Create temp history.jsonl with N runs, each listing package names."""
+        tmpdir = tempfile.mkdtemp()
+        path = Path(tmpdir) / "history.jsonl"
+        lines = []
+        for pkgs in runs:
+            discovered = [{"package": p, "category": "APT", "name": p} for p in pkgs]
+            record = {"timestamp": "2026-08-18T10:00:00", "discovered": discovered}
+            lines.append(json.dumps(record))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_streak_count_3_consecutive(self):
+        history = self._write_history([
+            ["fcitx5", "app1"],
+            ["fcitx5", "app1"],
+            ["fcitx5", "app2"],
+        ])
+        streaks = uc._count_discovery_streak(history)
+        self.assertEqual(streaks["fcitx5"], 3)
+        self.assertEqual(streaks["app2"], 1)
+
+    def test_streak_broken_by_absence(self):
+        history = self._write_history([
+            ["app1"],
+            [],           # gap
+            ["app1"],
+        ])
+        streaks = uc._count_discovery_streak(history)
+        self.assertEqual(streaks["app1"], 1)  # only last run counts
+
+    def test_empty_history_returns_empty(self):
+        path = Path(tempfile.mkdtemp()) / "history.jsonl"
+        streaks = uc._count_discovery_streak(path)
+        self.assertEqual(streaks, {})
+
+    def test_nonexistent_history_returns_empty(self):
+        path = Path(tempfile.mkdtemp()) / "missing.jsonl"
+        streaks = uc._count_discovery_streak(path)
+        self.assertEqual(streaks, {})
+
+    def test_partition_splits_by_threshold(self):
+        discovered = [
+            {"package": "fcitx5", "category": "APT", "name": "Fcitx5"},
+            {"package": "new-app", "category": "Standalone", "name": "New"},
+        ]
+        streaks = {"fcitx5": 3, "new-app": 1}
+        new, muted = uc._partition_discovered(discovered, streaks)
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]["package"], "new-app")
+        self.assertEqual(len(muted), 1)
+        self.assertEqual(muted[0]["package"], "fcitx5")
+
+    def test_ignore_section_auto_muted(self):
+        discovered = [
+            {"package": "libfoo", "category": "APT", "name": "libfoo",
+             "section": "libs"},
+        ]
+        streaks = {}  # first appearance, streak = 0
+        new, muted = uc._partition_discovered(discovered, streaks)
+        self.assertEqual(len(new), 0)
+        self.assertEqual(len(muted), 1)
+
+    def test_backward_compat_no_discovered_field(self):
+        tmpdir = tempfile.mkdtemp()
+        path = Path(tmpdir) / "history.jsonl"
+        # Old history without 'discovered' field
+        path.write_text('{"timestamp": "2026-01-01"}\n', encoding="utf-8")
+        streaks = uc._count_discovery_streak(path)
+        self.assertEqual(streaks, {})
+
+    def test_build_recommendations_muted_section(self):
+        """Muted items show in separate '3+ lần' section."""
+        discovered = [
+            {"package": "fcitx5", "category": "APT", "name": "Fcitx5",
+             "section": "x11"},
+            {"package": "new-app", "category": "Standalone", "name": "New App"},
+        ]
+        history = self._write_history([
+            ["fcitx5"], ["fcitx5"], ["fcitx5"],  # 3 consecutive
+        ])
+        lines = uc.build_recommendations([], discovered, [], history_path=history)
+        text = "\n".join(lines)
+        # new-app in main table
+        self.assertIn("new-app", text)
+        self.assertIn("Phần mềm phát hiện mới", text)
+        # fcitx5 in muted section with full command hint
+        self.assertIn("đã biết", text)
+        self.assertIn("check-all-updates --accept-discovery fcitx5:track", text)
 
 
 if __name__ == "__main__":
