@@ -13,6 +13,8 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIB_DIR = PROJECT_ROOT / "src"
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
+if not CONFIG_PATH.exists():
+    CONFIG_PATH = Path("~/.config/update-checker/config.toml").expanduser()
 sys.path.insert(0, str(LIB_DIR))
 
 import update_checker as uc  # noqa: E402
@@ -43,7 +45,9 @@ class FakeHttp:
         self.payload = payload
         self.text = text
 
-    def get_json(self, _url):
+    def get_json(self, url):
+        if isinstance(self.payload, dict) and url in self.payload:
+            return self.payload[url]
         return self.payload
 
     def get_text(self, _url):
@@ -212,6 +216,62 @@ class AssetSelectionTests(unittest.TestCase):
         action = checker.build_actions([result])[0]
         _release, asset = checker.select_github_asset(action)
         self.assertIn("ubuntu-24.04-amd64", asset["name"])
+
+    def test_fallback_to_recent_release_when_latest_has_no_matching_asset(self):
+        app = {
+            "id": "obsidian",
+            "name": "Obsidian",
+            "installed": {"type": "dpkg", "package": "obsidian"},
+            "latest": {"type": "github", "repo": "obsidianmd/obsidian-releases"},
+            "update": {
+                "type": "github_deb",
+                "repo": "obsidianmd/obsidian-releases",
+                "package": "obsidian",
+                "asset_regex": r"^obsidian_{version}_amd64\.deb$",
+            },
+        }
+        url_latest = "https://api.github.com/repos/obsidianmd/obsidian-releases/releases/latest"
+        url_releases = "https://api.github.com/repos/obsidianmd/obsidian-releases/releases?per_page=10"
+        payloads = {
+            url_latest: {
+                "tag_name": "v1.13.8",
+                "html_url": "https://github.com/obsidianmd/obsidian-releases/releases/tag/v1.13.8",
+                "assets": [{"name": "Obsidian-1.13.8.apk"}],
+            },
+            url_releases: [
+                {
+                    "tag_name": "v1.13.8",
+                    "html_url": "https://github.com/obsidianmd/obsidian-releases/releases/tag/v1.13.8",
+                    "assets": [{"name": "Obsidian-1.13.8.apk"}],
+                },
+                {
+                    "tag_name": "v1.13.7",
+                    "html_url": "https://github.com/obsidianmd/obsidian-releases/releases/tag/v1.13.7",
+                    "assets": [
+                        {"name": "Obsidian-1.13.7.apk"},
+                        {"name": "obsidian_1.13.7_amd64.deb"},
+                    ],
+                },
+            ],
+        }
+        checker = uc.UpdateChecker(
+            minimal_config([app]),
+            runner=FakeRunner(),
+            http=FakeHttp(payloads),
+            quiet=True,
+        )
+        # Check latest version resolves to 1.13.7 (not 1.13.8)
+        latest_ver = checker.latest_version(app, "1.13.7")
+        self.assertEqual(latest_ver, "1.13.7")
+
+        # Check select_github_asset picks obsidian_1.13.7_amd64.deb
+        result = uc.CheckResult(
+            "obsidian", "Obsidian", "GITHUB", "1.13.4", "1.13.7", "update", "github_deb"
+        )
+        action = checker.build_actions([result])[0]
+        release, asset = checker.select_github_asset(action)
+        self.assertEqual(release.version, "1.13.7")
+        self.assertEqual(asset["name"], "obsidian_1.13.7_amd64.deb")
 
 
 class SafetyAndOutputTests(unittest.TestCase):
@@ -795,8 +855,9 @@ class SoftMuteTests(unittest.TestCase):
         # new-app in main table
         self.assertIn("new-app", text)
         self.assertIn("Phần mềm phát hiện mới", text)
-        # fcitx5 in muted section
+        # fcitx5 in muted section with full command hint
         self.assertIn("đã biết", text)
+        self.assertIn("check-all-updates --accept-discovery fcitx5:track", text)
 
 
 if __name__ == "__main__":
