@@ -136,6 +136,13 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(result.status, "unknown")
         self.assertIn("could not be detected", result.error)
 
+    def test_missing_installed_version_is_warned(self):
+        with mock.patch.object(self.checker, "installed_version", return_value=None):
+            results = self.checker.check_all()
+        self.assertEqual(results, [])
+        app_id = self.checker.apps[0]["id"]
+        self.assertTrue(any(app_id in w and "skipped" in w for w in self.checker.warnings))
+
 
 class AssetSelectionTests(unittest.TestCase):
     def make_checker(self, app, assets, tag):
@@ -765,6 +772,84 @@ class AcceptDiscoveryTests(unittest.TestCase):
         with self.assertRaises(uc.ConfigError) as ctx:
             uc._accept_discovery(config_path, "missing:ignore", report_dir, yes=True)
         self.assertIn("not found", str(ctx.exception))
+
+    def test_track_twice_does_not_duplicate_app(self):
+        discovered = [{"category": "Standalone", "package": "tts", "name": "tts"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with redirect_stdout(io.StringIO()):
+            uc._accept_discovery(config_path, "tts:track", report_dir, yes=True)
+            rc = uc._accept_discovery(config_path, "tts:track", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        content = config_path.read_text()
+        self.assertEqual(content.count('id = "tts"'), 1)
+
+    def test_ignore_twice_does_not_duplicate_entry(self):
+        discovered = [{"category": "APT", "package": "existing", "name": "Existing"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with redirect_stdout(io.StringIO()):
+            rc = uc._accept_discovery(config_path, "existing:ignore", report_dir, yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(config_path.read_text().count('"existing"'), 1)
+
+    def test_track_standalone_uses_discovered_exec_path(self):
+        discovered = [{
+            "category": "Standalone", "package": "ide", "name": "IDE",
+            "exec_path": "/opt/IDE/bin/ide.sh",
+        }]
+        config_path, report_dir = self._setup_env(discovered)
+        with redirect_stdout(io.StringIO()):
+            uc._accept_discovery(config_path, "ide:track", report_dir, yes=True)
+        config = uc.tomllib.loads(config_path.read_text())
+        self.assertEqual(config["apps"][0]["installed"]["argv"][0], "/opt/IDE/bin/ide.sh")
+
+    def test_track_snap_uses_snap_sources(self):
+        discovered = [{"category": "Snap", "package": "kf6-core24", "name": "kf6-core24"}]
+        config_path, report_dir = self._setup_env(discovered)
+        with redirect_stdout(io.StringIO()):
+            uc._accept_discovery(config_path, "kf6-core24:track", report_dir, yes=True)
+        app = uc.tomllib.loads(config_path.read_text())["apps"][0]
+        self.assertEqual(app["installed"], {"type": "snap", "package": "kf6-core24"})
+        self.assertEqual(app["update"]["type"], "snap")
+
+    def test_invalid_result_is_not_written(self):
+        discovered = [{"category": "Standalone", "package": "bad", "name": 'Bad "App'}]
+        config_path, report_dir = self._setup_env(discovered)
+        original = config_path.read_text()
+        with self.assertRaises(uc.ConfigError):
+            uc._accept_discovery(config_path, "bad:track", report_dir, yes=True)
+        self.assertEqual(config_path.read_text(), original)
+
+
+class DiscoverTrackedIdTests(unittest.TestCase):
+    def test_tracked_id_is_not_rediscovered(self):
+        class SnapRunner(FakeRunner):
+            def run(self, argv, **kwargs):
+                if list(argv) == ["snap", "list"]:
+                    return uc.CommandResult(
+                        list(argv), 0,
+                        "Name Version Rev Tracking Publisher Notes\n"
+                        "kf6-core24 6.0 1 latest/stable kde -\n"
+                        "other-snap 1.0 1 latest/stable me -\n",
+                        "",
+                    )
+                return super().run(argv, **kwargs)
+
+        app = {
+            "id": "kf6-core24",
+            "name": "kf6-core24",
+            "installed": {"type": "command", "argv": ["/opt/kf6-core24/kf6-core24"]},
+            "latest": {"type": "github", "repo": "OWNER/REPO"},
+            "update": {"type": "manual"},
+        }
+        config = minimal_config([app])
+        config["discovery"] = {"enabled": True}
+        checker = uc.UpdateChecker(config, runner=SnapRunner(), http=FakeHttp({}), quiet=True)
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.dict("os.environ", {"HOME": home}):
+            discovered, _ = checker.discover()
+        packages = {item["package"] for item in discovered}
+        self.assertNotIn("kf6-core24", packages)
+        self.assertIn("other-snap", packages)
 
 
 
