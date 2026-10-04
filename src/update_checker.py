@@ -620,6 +620,13 @@ class UpdateChecker:
             result = self.check_one(app)
             if result is not None:
                 results.append(result)
+            else:
+                # Not installed, or the installed probe is misconfigured:
+                # surface it instead of dropping the app silently.
+                self.warn(
+                    f"{app['name']} ({app['id']}): installed version not found "
+                    f"via {app['installed']['type']} — skipped"
+                )
         return results
 
     def build_actions(self, results: list[CheckResult]) -> list[Action]:
@@ -941,6 +948,7 @@ class UpdateChecker:
                     "package": stem,
                     "name": name,
                     "version": "untracked",
+                    "exec_path": str(exec_path),
                 }
 
         snap_list = self.runner.run(["snap", "list"])
@@ -980,6 +988,7 @@ class UpdateChecker:
                     "package": path.name,
                     "name": path.name,
                     "version": "untracked",
+                    "exec_path": str(path),
                 }
 
         tracked_appimages = {
@@ -1028,7 +1037,13 @@ class UpdateChecker:
             if status == "install ok installed" and section != "oldlibs":
                 duplicates.append({"package": package, "sources": "APT + Snap"})
 
-        return list(found.values()), duplicates
+        # Apps accepted via --accept-discovery are tracked under the discovered
+        # id even when their installed source does not match the probe above.
+        tracked_ids = {str(app["id"]) for app in self.apps}
+        discovered = [
+            item for item in found.values() if item["package"] not in tracked_ids
+        ]
+        return discovered, duplicates
 
     def save_outputs(
         self,
@@ -1588,6 +1603,30 @@ latest = {{ type = "github", repo = "OWNER/REPO" }}
 update = {{ type = "manual" }}
 """
 
+_TRACK_TEMPLATE_SNAP = """\n# --- Added by --accept-discovery {timestamp} ---
+[[apps]]
+id = "{app_id}"
+name = "{name}"
+installed = {{ type = "snap", package = "{package}" }}
+latest = {{ type = "snap", package = "{package}" }}
+update = {{ type = "snap", package = "{package}" }}
+"""
+
+
+def _parse_config_text(text: str, config_path: Path) -> dict[str, Any]:
+    """Parse config text and reject duplicate app ids, as load_config does."""
+    try:
+        config = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"cannot parse {config_path}: {exc}") from exc
+    seen: set[str] = set()
+    for app in config.get("apps", []):
+        app_id = str(app.get("id", ""))
+        if app_id in seen:
+            raise ConfigError(f"duplicate app id: {app_id}")
+        seen.add(app_id)
+    return config
+
 
 def _insert_into_toml_array(text: str, section: str, key: str,
                             value: str) -> str:
@@ -1703,13 +1742,24 @@ def _accept_discovery(config_path: Path, spec: str, report_dir: Path,
     if not config_path.exists():
         raise ConfigError(f"config not found: {config_path}")
     original = config_path.read_text(encoding="utf-8")
+    current = _parse_config_text(original, config_path)
 
     category = match.get("category", "APT")
     name = match.get("name", app_id)
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    ignore_key = _IGNORE_KEY_MAP.get(category, "ignore_deb_packages")
+
+    # Re-running the same command must not append a second entry.
+    if action == "track" and any(
+        str(app.get("id")) == app_id for app in current.get("apps", [])
+    ):
+        print(f"ℹ️ '{app_id}' is already tracked in {config_path} — no changes made.")
+        return 0
+    if action == "ignore" and app_id in current.get("discovery", {}).get(ignore_key, []):
+        print(f"ℹ️ '{app_id}' is already in [discovery].{ignore_key} — no changes made.")
+        return 0
 
     if action == "ignore":
-        ignore_key = _IGNORE_KEY_MAP.get(category, "ignore_deb_packages")
         modified = _insert_into_toml_array(original, "discovery", ignore_key, app_id)
     else:  # track
         ai_generated = None
@@ -1728,12 +1778,20 @@ def _accept_discovery(config_path: Path, spec: str, report_dir: Path,
                 block = _TRACK_TEMPLATE_APT.format(
                     timestamp=now, app_id=app_id, name=name, package=package,
                 )
+            elif category == "Snap":
+                block = _TRACK_TEMPLATE_SNAP.format(
+                    timestamp=now, app_id=app_id, name=name, package=package,
+                )
             else:
-                exec_path = f"/opt/{app_id}/{app_id}"
+                # Older history records lack exec_path; keep the placeholder.
+                exec_path = match.get("exec_path") or f"/opt/{app_id}/{app_id}"
                 block = _TRACK_TEMPLATE_STANDALONE.format(
                     timestamp=now, app_id=app_id, name=name, exec_path=exec_path,
                 )
         modified = original.rstrip() + "\n" + block
+
+    # Fail closed: never write a config that the checker would refuse to load.
+    _parse_config_text(modified, config_path)
 
     # Show diff preview
     if not yes:
